@@ -59,6 +59,8 @@ scope-core = { path = "crates/scope-core" }
 
 # GUI (new binary: scope-gui)
 iced = { version = "0.12", default-features = false, features = ["tokio", "wgpu", "svg"] }
+iced_futures = "0.12"
+iced_core = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 ctrlc = "3.4.3"

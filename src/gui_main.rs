@@ -1,8 +1,10 @@
 #![deny(warnings)]
 
+mod gui_keyboard;
+
 use chrono::Local;
 use iced::futures::{future, SinkExt};
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
 use iced::{Application, Element, Length, Settings, Subscription, Theme};
 use scope_core::engine::{EngineCommand, EngineEvent};
 use scope_core::format::{bytes_to_mixed_segments, SegmentKind};
@@ -33,6 +35,10 @@ struct ScopeGui {
     input: String,
 
     log: Vec<LogLine>,
+
+    log_scroll_id: scrollable::Id,
+    auto_scroll: bool,
+    scroll_x: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +62,52 @@ enum Message {
     ConnectClicked,
     DisconnectClicked,
     SendPressed,
+    JumpToEnd,
+    AutoScrollToggled(bool),
+    LogScrolled(scrollable::Viewport),
     EngineEvent(EngineEvent),
+}
+
+fn shortcut_to_message(s: gui_keyboard::Shortcut) -> Message {
+    match s {
+        gui_keyboard::Shortcut::JumpToEnd => Message::JumpToEnd,
+    }
+}
+
+impl ScopeGui {
+    fn engine_subscription(&self) -> Subscription<Message> {
+        let evt_rx = self.evt_rx;
+        iced::subscription::channel("engine-events", 256, move |mut output| async move {
+            loop {
+                let evt = {
+                    let mut rx = evt_rx.lock().await;
+                    rx.recv().await
+                };
+
+                let msg = match evt {
+                    Some(evt) => Message::EngineEvent(evt),
+                    None => Message::EngineEvent(EngineEvent::Error("engine stopped".into())),
+                };
+
+                if output.send(msg).await.is_err() {
+                    break;
+                }
+            }
+
+            // Subscription API expects this task to never finish.
+            future::pending::<std::convert::Infallible>().await
+        })
+    }
+
+    fn snap_to_end(&self) -> iced::Command<Message> {
+        scrollable::snap_to(
+            self.log_scroll_id.clone(),
+            scrollable::RelativeOffset {
+                x: self.scroll_x,
+                y: 1.0,
+            },
+        )
+    }
 }
 
 impl Application for ScopeGui {
@@ -87,6 +138,9 @@ impl Application for ScopeGui {
                         kind: SegmentKind::Plain,
                     }],
                 }],
+                log_scroll_id: scrollable::Id::unique(),
+                auto_scroll: true,
+                scroll_x: 0.0,
             },
             iced::Command::none(),
         )
@@ -97,27 +151,10 @@ impl Application for ScopeGui {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        let evt_rx = self.evt_rx;
-        iced::subscription::channel("engine-events", 256, move |mut output| async move {
-            loop {
-                let evt = {
-                    let mut rx = evt_rx.lock().await;
-                    rx.recv().await
-                };
-
-                let msg = match evt {
-                    Some(evt) => Message::EngineEvent(evt),
-                    None => Message::EngineEvent(EngineEvent::Error("engine stopped".into())),
-                };
-
-                if output.send(msg).await.is_err() {
-                    break;
-                }
-            }
-
-            // Subscription API expects this task to never finish.
-            future::pending::<std::convert::Infallible>().await
-        })
+        Subscription::batch([
+            self.engine_subscription(),
+            gui_keyboard::subscription().map(shortcut_to_message),
+        ])
     }
 
     fn update(&mut self, message: Self::Message) -> iced::Command<Self::Message> {
@@ -195,6 +232,27 @@ impl Application for ScopeGui {
                 );
             }
 
+            Message::JumpToEnd => {
+                self.auto_scroll = true;
+                return self.snap_to_end();
+            }
+
+            Message::AutoScrollToggled(enabled) => {
+                self.auto_scroll = enabled;
+                if self.auto_scroll {
+                    return self.snap_to_end();
+                }
+            }
+
+            Message::LogScrolled(viewport) => {
+                let rel = viewport.relative_offset();
+                self.scroll_x = rel.x;
+
+                // If the user scrolls away from the bottom, disable auto-scroll.
+                // If they scroll back to the bottom, re-enable it.
+                self.auto_scroll = rel.y >= 0.999;
+            }
+
             Message::EngineEvent(evt) => match evt {
                 EngineEvent::ConnectionState(s) => {
                     self.connection = s;
@@ -224,6 +282,10 @@ impl Application for ScopeGui {
                         let drain = self.log.len() - 5000;
                         self.log.drain(0..drain);
                     }
+
+                    if self.auto_scroll {
+                        return self.snap_to_end();
+                    }
                 }
                 EngineEvent::Error(e) => {
                     self.log.push(LogLine {
@@ -244,7 +306,7 @@ impl Application for ScopeGui {
     fn view(&self) -> Element<'_, Self::Message> {
         let status = match self.connection {
             ConnectionState::Disconnected => "Disconnected",
-            ConnectionState::Connecting => "Connecting…",
+            ConnectionState::Connecting => "Connecting...",
             ConnectionState::Connected => "Connected",
         };
 
@@ -265,6 +327,8 @@ impl Application for ScopeGui {
                 .width(Length::Fixed(120.0)),
             button("Connect").on_press(Message::ConnectClicked),
             button("Disconnect").on_press(Message::DisconnectClicked),
+            checkbox("Auto-scroll", self.auto_scroll).on_toggle(Message::AutoScrollToggled),
+            button("Jump to end").on_press(Message::JumpToEnd),
         ]
         .spacing(12);
 
@@ -298,6 +362,8 @@ impl Application for ScopeGui {
         });
 
         let log_view = scrollable(log_column)
+            .id(self.log_scroll_id.clone())
+            .on_scroll(Message::LogScrolled)
             .direction(scrollable::Direction::Both {
                 vertical: scrollable::Properties::new(),
                 horizontal: scrollable::Properties::new(),
@@ -306,7 +372,7 @@ impl Application for ScopeGui {
             .width(Length::Fill);
 
         let input = row![
-            text_input("Type and press Enter to send…", &self.input)
+            text_input("Type and press Enter to send...", &self.input)
                 .on_input(Message::InputChanged)
                 .on_submit(Message::SendPressed)
                 .width(Length::Fill),

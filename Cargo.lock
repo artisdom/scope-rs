@@ -2869,6 +2869,8 @@ dependencies = [
  "futures",
  "homedir",
  "iced",
+ "iced_core",
+ "iced_futures",
  "mlua",
  "rand",
  "ratatui",
