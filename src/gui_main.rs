@@ -4,6 +4,7 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input}
 use iced::{Application, Element, Length, Settings, Subscription, Theme};
 use iced::futures::{future, SinkExt};
 use scope_core::engine::{EngineCommand, EngineEvent};
+use scope_core::format::bytes_to_mixed_ascii;
 use scope_core::model::{ConnectionState, Direction, SerialConfig};
 use tokio::sync::Mutex;
 
@@ -170,7 +171,7 @@ impl Application for ScopeGui {
                         Direction::Tx => "TX",
                         Direction::System => "SYS",
                     };
-                    let body = String::from_utf8_lossy(&m.bytes);
+                    let body = bytes_to_mixed_ascii(&m.bytes);
                     self.log.push(format!("[{dir}] {body}"));
 
                     // Keep log bounded (simple cap for now)
