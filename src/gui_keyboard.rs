@@ -10,6 +10,14 @@ use iced_core::Hasher;
 #[derive(Debug, Clone)]
 pub enum Shortcut {
     JumpToEnd,
+    JumpToStart,
+    ScrollPageUp,
+    ScrollPageDown,
+    HistoryPrev,
+    HistoryNext,
+    SaveHistory,
+    ToggleRecord,
+    ClearLog,
 }
 
 struct ShortcutRecipe;
@@ -28,12 +36,34 @@ impl Recipe for ShortcutRecipe {
             iced::futures::future::ready(match event {
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     let key = key.as_ref();
-                    // Ctrl+End is a common "jump to bottom" gesture.
                     if matches!(key, Key::Named(keyboard::key::Named::End)) && modifiers.control() {
-                        Some(Shortcut::JumpToEnd)
-                    } else {
-                        None
+                        return Some(Shortcut::JumpToEnd);
                     }
+                    if matches!(key, Key::Named(keyboard::key::Named::Home)) && modifiers.control() {
+                        return Some(Shortcut::JumpToStart);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::PageUp)) {
+                        return Some(Shortcut::ScrollPageUp);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::PageDown)) {
+                        return Some(Shortcut::ScrollPageDown);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::ArrowUp)) {
+                        return Some(Shortcut::HistoryPrev);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::ArrowDown)) {
+                        return Some(Shortcut::HistoryNext);
+                    }
+                    if matches!(key, Key::Character("s")) && modifiers.control() {
+                        return Some(Shortcut::SaveHistory);
+                    }
+                    if matches!(key, Key::Character("r")) && modifiers.control() {
+                        return Some(Shortcut::ToggleRecord);
+                    }
+                    if matches!(key, Key::Character("l")) && modifiers.control() {
+                        return Some(Shortcut::ClearLog);
+                    }
+                    None
                 }
                 _ => None,
             })
