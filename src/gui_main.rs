@@ -1,8 +1,9 @@
 #![deny(warnings)]
 
+use chrono::Local;
+use iced::futures::{future, SinkExt};
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Application, Element, Length, Settings, Subscription, Theme};
-use iced::futures::{future, SinkExt};
 use scope_core::engine::{EngineCommand, EngineEvent};
 use scope_core::format::{bytes_to_mixed_segments, SegmentKind};
 use scope_core::model::{ConnectionState, Direction, SerialConfig};
@@ -36,6 +37,7 @@ struct ScopeGui {
 
 #[derive(Debug, Clone)]
 struct LogLine {
+    timestamp: String,
     prefix: String,
     segments: Vec<LogSegment>,
 }
@@ -78,6 +80,7 @@ impl Application for ScopeGui {
                 baudrate: "115200".to_string(),
                 input: String::new(),
                 log: vec![LogLine {
+                    timestamp: Local::now().format("%H:%M:%S.%3f").to_string(),
                     prefix: "[SYS]".to_string(),
                     segments: vec![LogSegment {
                         text: "Scope (GUI) started".to_string(),
@@ -126,6 +129,7 @@ impl Application for ScopeGui {
             Message::ConnectClicked => {
                 if self.port.trim().is_empty() {
                     self.log.push(LogLine {
+                        timestamp: Local::now().format("%H:%M:%S.%3f").to_string(),
                         prefix: "[ERR]".to_string(),
                         segments: vec![LogSegment {
                             text: "Port is empty".to_string(),
@@ -140,6 +144,7 @@ impl Application for ScopeGui {
                     Ok(b) => b,
                     Err(_) => {
                         self.log.push(LogLine {
+                            timestamp: Local::now().format("%H:%M:%S.%3f").to_string(),
                             prefix: "[ERR]".to_string(),
                             segments: vec![LogSegment {
                                 text: "Baudrate is not a number".to_string(),
@@ -209,6 +214,7 @@ impl Application for ScopeGui {
                         .collect::<Vec<_>>();
 
                     self.log.push(LogLine {
+                        timestamp: m.at.format("%H:%M:%S.%3f").to_string(),
                         prefix: format!("[{dir}]"),
                         segments,
                     });
@@ -221,6 +227,7 @@ impl Application for ScopeGui {
                 }
                 EngineEvent::Error(e) => {
                     self.log.push(LogLine {
+                        timestamp: Local::now().format("%H:%M:%S.%3f").to_string(),
                         prefix: "[ERR]".to_string(),
                         segments: vec![LogSegment {
                             text: e,
@@ -263,7 +270,8 @@ impl Application for ScopeGui {
 
         let escape_color = iced::Color::from_rgb8(0xE6, 0xC2, 0x2E); // warm yellow
         let plain_color = iced::Color::WHITE;
-        let prefix_color = iced::Color::from_rgb8(0x88, 0x88, 0x88);
+        let meta_color = iced::Color::from_rgb8(0x88, 0x88, 0x88);
+        let monospace = iced::Font::MONOSPACE;
 
         let log_column = self.log.iter().fold(column![], |c, line| {
             let segs_row = line.segments.iter().fold(row![].spacing(0), |r, seg| {
@@ -272,17 +280,30 @@ impl Application for ScopeGui {
                     SegmentKind::Escape => escape_color,
                 };
 
-                r.push(text(&seg.text).style(color))
+                r.push(text(&seg.text).font(monospace).style(color))
             });
 
+            // Fixed-width prefix by padding (monospace font).
+            let prefix = format!("{:<5}", line.prefix);
+
             c.push(
-                row![text(&line.prefix).style(prefix_color), segs_row]
-                    .spacing(8)
-                    .width(Length::Fill),
+                row![
+                    text(&line.timestamp).font(monospace).style(meta_color),
+                    text(prefix).font(monospace).style(meta_color),
+                    segs_row,
+                ]
+                .spacing(12)
+                .width(Length::Shrink),
             )
         });
 
-        let log_view = scrollable(log_column).height(Length::Fill).width(Length::Fill);
+        let log_view = scrollable(log_column)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Properties::new(),
+                horizontal: scrollable::Properties::new(),
+            })
+            .height(Length::Fill)
+            .width(Length::Fill);
 
         let input = row![
             text_input("Type and press Enter to send…", &self.input)
