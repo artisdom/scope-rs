@@ -4,7 +4,7 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input}
 use iced::{Application, Element, Length, Settings, Subscription, Theme};
 use iced::futures::{future, SinkExt};
 use scope_core::engine::{EngineCommand, EngineEvent};
-use scope_core::format::bytes_to_mixed_ascii;
+use scope_core::format::{bytes_to_mixed_segments, SegmentKind};
 use scope_core::model::{ConnectionState, Direction, SerialConfig};
 use tokio::sync::Mutex;
 
@@ -31,8 +31,19 @@ struct ScopeGui {
 
     input: String,
 
-    // Rendered log lines (UTF-8 lossy for now)
-    log: Vec<String>,
+    log: Vec<LogLine>,
+}
+
+#[derive(Debug, Clone)]
+struct LogLine {
+    prefix: String,
+    segments: Vec<LogSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct LogSegment {
+    text: String,
+    kind: SegmentKind,
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +77,13 @@ impl Application for ScopeGui {
                 port: String::new(),
                 baudrate: "115200".to_string(),
                 input: String::new(),
-                log: vec!["Scope (GUI) started".to_string()],
+                log: vec![LogLine {
+                    prefix: "[SYS]".to_string(),
+                    segments: vec![LogSegment {
+                        text: "Scope (GUI) started".to_string(),
+                        kind: SegmentKind::Plain,
+                    }],
+                }],
             },
             iced::Command::none(),
         )
@@ -108,7 +125,13 @@ impl Application for ScopeGui {
 
             Message::ConnectClicked => {
                 if self.port.trim().is_empty() {
-                    self.log.push("[ERR] Port is empty".to_string());
+                    self.log.push(LogLine {
+                        prefix: "[ERR]".to_string(),
+                        segments: vec![LogSegment {
+                            text: "Port is empty".to_string(),
+                            kind: SegmentKind::Plain,
+                        }],
+                    });
                     return iced::Command::none();
                 }
 
@@ -116,7 +139,13 @@ impl Application for ScopeGui {
                 let baudrate = match baudrate {
                     Ok(b) => b,
                     Err(_) => {
-                        self.log.push("[ERR] Baudrate is not a number".to_string());
+                        self.log.push(LogLine {
+                            prefix: "[ERR]".to_string(),
+                            segments: vec![LogSegment {
+                                text: "Baudrate is not a number".to_string(),
+                                kind: SegmentKind::Plain,
+                            }],
+                        });
                         return iced::Command::none();
                     }
                 };
@@ -171,8 +200,18 @@ impl Application for ScopeGui {
                         Direction::Tx => "TX",
                         Direction::System => "SYS",
                     };
-                    let body = bytes_to_mixed_ascii(&m.bytes);
-                    self.log.push(format!("[{dir}] {body}"));
+                    let segments = bytes_to_mixed_segments(&m.bytes)
+                        .into_iter()
+                        .map(|s| LogSegment {
+                            text: s.text,
+                            kind: s.kind,
+                        })
+                        .collect::<Vec<_>>();
+
+                    self.log.push(LogLine {
+                        prefix: format!("[{dir}]"),
+                        segments,
+                    });
 
                     // Keep log bounded (simple cap for now)
                     if self.log.len() > 5000 {
@@ -181,7 +220,13 @@ impl Application for ScopeGui {
                     }
                 }
                 EngineEvent::Error(e) => {
-                    self.log.push(format!("[ERR] {e}"));
+                    self.log.push(LogLine {
+                        prefix: "[ERR]".to_string(),
+                        segments: vec![LogSegment {
+                            text: e,
+                            kind: SegmentKind::Plain,
+                        }],
+                    });
                 }
             },
         }
@@ -216,14 +261,28 @@ impl Application for ScopeGui {
         ]
         .spacing(12);
 
-        let log_column = self
-            .log
-            .iter()
-            .fold(column![], |c, line| c.push(text(line)));
+        let escape_color = iced::Color::from_rgb8(0xE6, 0xC2, 0x2E); // warm yellow
+        let plain_color = iced::Color::WHITE;
+        let prefix_color = iced::Color::from_rgb8(0x88, 0x88, 0x88);
 
-        let log_view = scrollable(log_column)
-            .height(Length::Fill)
-            .width(Length::Fill);
+        let log_column = self.log.iter().fold(column![], |c, line| {
+            let segs_row = line.segments.iter().fold(row![].spacing(0), |r, seg| {
+                let color = match seg.kind {
+                    SegmentKind::Plain => plain_color,
+                    SegmentKind::Escape => escape_color,
+                };
+
+                r.push(text(&seg.text).style(color))
+            });
+
+            c.push(
+                row![text(&line.prefix).style(prefix_color), segs_row]
+                    .spacing(8)
+                    .width(Length::Fill),
+            )
+        });
+
+        let log_view = scrollable(log_column).height(Length::Fill).width(Length::Fill);
 
         let input = row![
             text_input("Type and press Enter to send…", &self.input)
