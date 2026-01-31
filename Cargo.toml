@@ -29,6 +29,10 @@ maintenance = { status = 'actively-developed' }
 name = "scope"
 path = "src/main.rs"
 
+[[bin]]
+name = "scope-gui"
+path = "src/gui_main.rs"
+
 [dependencies]
 serialport = "4.4.0"
 ratatui = "0.26.1"
@@ -44,6 +48,9 @@ anyhow = "1.0.79"
 homedir = "0.2.1"
 tokio = { version = "1.36.0", features = ["full"] }
 regex = "1.10.5"
+
+# GUI (new binary: scope-gui)
+iced = { version = "0.12", default-features = false, features = ["tokio", "wgpu", "svg"] }
 
 [target.'cfg(windows)'.dependencies]
 ctrlc = "3.4.3"
