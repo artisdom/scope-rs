@@ -18,6 +18,9 @@ pub enum Shortcut {
     SaveHistory,
     ToggleRecord,
     ClearLog,
+    SendNoCrlf,
+    SearchNext,
+    SearchPrev,
 }
 
 struct ShortcutRecipe;
@@ -54,6 +57,15 @@ impl Recipe for ShortcutRecipe {
                     }
                     if matches!(key, Key::Named(keyboard::key::Named::ArrowDown)) {
                         return Some(Shortcut::HistoryNext);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::Enter)) && modifiers.alt() {
+                        return Some(Shortcut::SendNoCrlf);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::F3)) && modifiers.shift() {
+                        return Some(Shortcut::SearchPrev);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::F3)) {
+                        return Some(Shortcut::SearchNext);
                     }
                     if matches!(key, Key::Character("s")) && modifiers.control() {
                         return Some(Shortcut::SaveHistory);

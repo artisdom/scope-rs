@@ -1,4 +1,6 @@
-use crate::model::{ConnectionState, Direction, LogMessage, SerialConfig};
+use crate::model::{
+    ConnectionState, DataBits, Direction, FlowControl, LogMessage, Parity, SerialConfig, StopBits,
+};
 use anyhow::Context;
 use tokio::sync::mpsc;
 
@@ -169,5 +171,41 @@ pub fn spawn() -> EngineHandle {
 fn try_open(cfg: &SerialConfig) -> Result<Box<dyn serialport::SerialPort>, serialport::Error> {
     serialport::new(cfg.port.clone(), cfg.baudrate)
         .timeout(std::time::Duration::from_millis(50))
+        .flow_control(to_flow_control(cfg.flow_control))
+        .data_bits(to_data_bits(cfg.data_bits))
+        .parity(to_parity(cfg.parity))
+        .stop_bits(to_stop_bits(cfg.stop_bits))
         .open()
+}
+
+fn to_flow_control(flow: FlowControl) -> serialport::FlowControl {
+    match flow {
+        FlowControl::None => serialport::FlowControl::None,
+        FlowControl::Software => serialport::FlowControl::Software,
+        FlowControl::Hardware => serialport::FlowControl::Hardware,
+    }
+}
+
+fn to_data_bits(bits: DataBits) -> serialport::DataBits {
+    match bits {
+        DataBits::Five => serialport::DataBits::Five,
+        DataBits::Six => serialport::DataBits::Six,
+        DataBits::Seven => serialport::DataBits::Seven,
+        DataBits::Eight => serialport::DataBits::Eight,
+    }
+}
+
+fn to_parity(parity: Parity) -> serialport::Parity {
+    match parity {
+        Parity::None => serialport::Parity::None,
+        Parity::Odd => serialport::Parity::Odd,
+        Parity::Even => serialport::Parity::Even,
+    }
+}
+
+fn to_stop_bits(bits: StopBits) -> serialport::StopBits {
+    match bits {
+        StopBits::One => serialport::StopBits::One,
+        StopBits::Two => serialport::StopBits::Two,
+    }
 }

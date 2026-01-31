@@ -6,20 +6,39 @@ mod infra;
 
 use chrono::Local;
 use iced::futures::{future, SinkExt};
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Application, Element, Length, Settings, Subscription, Theme};
 use scope_core::engine::{EngineCommand, EngineEvent};
 use scope_core::format::{bytes_to_ansi_segments, AnsiColor, SegmentKind};
-use scope_core::model::{ConnectionState, Direction, SerialConfig};
+use scope_core::model::{
+    ConnectionState, DataBits, Direction, FlowControl, Parity, SerialConfig, StopBits,
+};
 use tokio::sync::Mutex;
 
 use crate::infra::recorder::Recorder;
 use crate::infra::typewriter::TypeWriter;
 
+const FLOW_OPTIONS: [FlowControl; 3] = [
+    FlowControl::None,
+    FlowControl::Software,
+    FlowControl::Hardware,
+];
+const DATA_OPTIONS: [DataBits; 4] = [
+    DataBits::Five,
+    DataBits::Six,
+    DataBits::Seven,
+    DataBits::Eight,
+];
+const PARITY_OPTIONS: [Parity; 3] = [Parity::None, Parity::Odd, Parity::Even];
+const STOP_OPTIONS: [StopBits; 2] = [StopBits::One, StopBits::Two];
+
 fn main() -> iced::Result {
     ScopeGui::run(Settings {
         window: iced::window::Settings {
             size: iced::Size::new(980.0, 640.0),
+            min_size: Some(iced::Size::new(860.0, 540.0)),
             ..Default::default()
         },
         ..Default::default()
@@ -36,12 +55,21 @@ struct ScopeGui {
 
     port: String,
     baudrate: String,
+    flow_control: FlowControl,
+    data_bits: DataBits,
+    parity: Parity,
+    stop_bits: StopBits,
 
     input: String,
     history: Vec<String>,
     history_index: Option<usize>,
     history_backup: String,
     append_crlf: bool,
+
+    search_query: String,
+    search_case_sensitive: bool,
+    search_matches: Vec<usize>,
+    search_index: Option<usize>,
 
     log: Vec<LogLine>,
 
@@ -85,10 +113,19 @@ enum Message {
     ConnectClicked,
     DisconnectClicked,
     SendPressed,
+    SendPressedNoCrlf,
     JumpToEnd,
     JumpToStart,
     AutoScrollToggled(bool),
     AppendCrlfToggled(bool),
+    FlowControlChanged(FlowControl),
+    DataBitsChanged(DataBits),
+    ParityChanged(Parity),
+    StopBitsChanged(StopBits),
+    SearchQueryChanged(String),
+    SearchCaseToggled(bool),
+    SearchNext,
+    SearchPrev,
     LogScrolled(scrollable::Viewport),
     ScrollPageUp,
     ScrollPageDown,
@@ -111,6 +148,9 @@ fn shortcut_to_message(s: gui_keyboard::Shortcut) -> Message {
         gui_keyboard::Shortcut::SaveHistory => Message::SaveHistory,
         gui_keyboard::Shortcut::ToggleRecord => Message::ToggleRecord,
         gui_keyboard::Shortcut::ClearLog => Message::ClearLog,
+        gui_keyboard::Shortcut::SendNoCrlf => Message::SendPressedNoCrlf,
+        gui_keyboard::Shortcut::SearchNext => Message::SearchNext,
+        gui_keyboard::Shortcut::SearchPrev => Message::SearchPrev,
     }
 }
 
@@ -197,6 +237,13 @@ impl ScopeGui {
             self.log.drain(0..drain);
         }
 
+        if !self.search_query.trim().is_empty() {
+            self.recompute_search_matches();
+            if self.search_index.is_none() && !self.search_matches.is_empty() {
+                self.search_index = Some(0);
+            }
+        }
+
         if self.auto_scroll {
             return Some(self.snap_to_end());
         }
@@ -261,6 +308,76 @@ impl ScopeGui {
         }
     }
 
+    fn send_input(&mut self, append_crlf: bool) -> Option<iced::Command<Message>> {
+        let raw = self.input.trim().to_string();
+        if raw.is_empty() {
+            return None;
+        }
+
+        self.input.clear();
+        self.history_index = None;
+
+        if self.history.last().map(|s| s.as_str()) != Some(raw.as_str()) {
+            self.history.push(raw.clone());
+        }
+
+        if raw.starts_with('!') {
+            return self.handle_command(raw);
+        }
+
+        let mut bytes = Self::replace_hex_sequence(raw);
+        if append_crlf {
+            bytes.extend_from_slice(b"\r\n");
+        }
+
+        let tx = self.cmd_tx.clone();
+        Some(iced::Command::perform(
+            async move {
+                let _ = tx.send(EngineCommand::SendBytes(bytes)).await;
+            },
+            |_| Message::InputChanged(String::new()),
+        ))
+    }
+
+    fn recompute_search_matches(&mut self) {
+        self.search_matches.clear();
+        if self.search_query.trim().is_empty() {
+            return;
+        }
+
+        let needle = if self.search_case_sensitive {
+            self.search_query.clone()
+        } else {
+            self.search_query.to_lowercase()
+        };
+
+        for (idx, line) in self.log.iter().enumerate() {
+            let hay = if self.search_case_sensitive {
+                line.full_text()
+            } else {
+                line.full_text().to_lowercase()
+            };
+
+            if hay.contains(&needle) {
+                self.search_matches.push(idx);
+            }
+        }
+    }
+
+    fn jump_to_search_match(&mut self) -> Option<iced::Command<Message>> {
+        let index = self.search_index?;
+        let line_index = *self.search_matches.get(index)? as f32;
+        let total = self.log.len().saturating_sub(1) as f32;
+        let y = if total <= 0.0 {
+            0.0
+        } else {
+            (line_index / total).clamp(0.0, 1.0)
+        };
+        self.auto_scroll = false;
+        self.scroll_y = y;
+        Some(self.snap_to_relative(y))
+    }
+
     fn connect_from_fields(&mut self) -> Option<iced::Command<Message>> {
         if self.port.trim().is_empty() {
             self.push_system_error("Port is empty".to_string());
@@ -278,6 +395,10 @@ impl ScopeGui {
         let cfg = SerialConfig {
             port: self.port.trim().to_string(),
             baudrate,
+            flow_control: self.flow_control,
+            data_bits: self.data_bits,
+            parity: self.parity,
+            stop_bits: self.stop_bits,
         };
 
         let tx = self.cmd_tx.clone();
@@ -322,6 +443,72 @@ impl ScopeGui {
                             },
                             |_| Message::InputChanged(String::new()),
                         ));
+                    }
+                    "flow" => {
+                        let Some(value) = parts.next() else {
+                            self.push_system_error("Usage: !serial flow none|sw|hw".to_string());
+                            return None;
+                        };
+                        self.flow_control = match value {
+                            "none" => FlowControl::None,
+                            "sw" | "software" => FlowControl::Software,
+                            "hw" | "hardware" => FlowControl::Hardware,
+                            _ => {
+                                self.push_system_error("Invalid flow control".to_string());
+                                return None;
+                            }
+                        };
+                        self.push_system_info(format!("Flow control set to {value}"));
+                    }
+                    "parity" => {
+                        let Some(value) = parts.next() else {
+                            self.push_system_error(
+                                "Usage: !serial parity none|odd|even".to_string(),
+                            );
+                            return None;
+                        };
+                        self.parity = match value {
+                            "none" => Parity::None,
+                            "odd" => Parity::Odd,
+                            "even" => Parity::Even,
+                            _ => {
+                                self.push_system_error("Invalid parity".to_string());
+                                return None;
+                            }
+                        };
+                        self.push_system_info(format!("Parity set to {value}"));
+                    }
+                    "databits" => {
+                        let Some(value) = parts.next() else {
+                            self.push_system_error("Usage: !serial databits 5|6|7|8".to_string());
+                            return None;
+                        };
+                        self.data_bits = match value {
+                            "5" => DataBits::Five,
+                            "6" => DataBits::Six,
+                            "7" => DataBits::Seven,
+                            "8" => DataBits::Eight,
+                            _ => {
+                                self.push_system_error("Invalid data bits".to_string());
+                                return None;
+                            }
+                        };
+                        self.push_system_info(format!("Data bits set to {value}"));
+                    }
+                    "stopbits" => {
+                        let Some(value) = parts.next() else {
+                            self.push_system_error("Usage: !serial stopbits 1|2".to_string());
+                            return None;
+                        };
+                        self.stop_bits = match value {
+                            "1" => StopBits::One,
+                            "2" => StopBits::Two,
+                            _ => {
+                                self.push_system_error("Invalid stop bits".to_string());
+                                return None;
+                            }
+                        };
+                        self.push_system_info(format!("Stop bits set to {value}"));
                     }
                     _ => {
                         self.push_system_error("Invalid serial subcommand".to_string());
@@ -425,12 +612,7 @@ impl ScopeGui {
 
 impl LogLine {
     fn serialize(&self, timestamp: &chrono::DateTime<Local>) -> String {
-        let content = self
-            .segments
-            .iter()
-            .map(|seg| seg.text.clone())
-            .collect::<Vec<_>>()
-            .join("");
+        let content = self.full_text();
 
         match self.kind {
             LogKind::Rx => format!("[{}][ <=] {}", timestamp.format("%H:%M:%S.%3f"), content),
@@ -438,6 +620,14 @@ impl LogLine {
             LogKind::Sys => format!("[{}][SYS] {}", timestamp.format("%H:%M:%S.%3f"), content),
             LogKind::Err => format!("[{}][ERR] {}", timestamp.format("%H:%M:%S.%3f"), content),
         }
+    }
+
+    fn full_text(&self) -> String {
+        self.segments
+            .iter()
+            .map(|seg| seg.text.clone())
+            .collect::<Vec<_>>()
+            .join("")
     }
 }
 
@@ -463,11 +653,19 @@ impl Application for ScopeGui {
                 connection: ConnectionState::Disconnected,
                 port: String::new(),
                 baudrate: "115200".to_string(),
+                flow_control: FlowControl::None,
+                data_bits: DataBits::Eight,
+                parity: Parity::None,
+                stop_bits: StopBits::One,
                 input: String::new(),
                 history: vec![],
                 history_index: None,
                 history_backup: String::new(),
                 append_crlf: true,
+                search_query: String::new(),
+                search_case_sensitive: false,
+                search_matches: vec![],
+                search_index: None,
                 log: vec![LogLine {
                     timestamp: Local::now().format("%H:%M:%S.%3f").to_string(),
                     prefix: "[SYS]".to_string(),
@@ -494,6 +692,10 @@ impl Application for ScopeGui {
         "Scope (GUI)".to_string()
     }
 
+    fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+
     fn subscription(&self) -> Subscription<Self::Message> {
         Subscription::batch([
             self.engine_subscription(),
@@ -507,6 +709,58 @@ impl Application for ScopeGui {
             Message::BaudChanged(s) => self.baudrate = s,
             Message::InputChanged(s) => self.input = s,
             Message::AppendCrlfToggled(enabled) => self.append_crlf = enabled,
+            Message::FlowControlChanged(flow) => self.flow_control = flow,
+            Message::DataBitsChanged(bits) => self.data_bits = bits,
+            Message::ParityChanged(parity) => self.parity = parity,
+            Message::StopBitsChanged(bits) => self.stop_bits = bits,
+            Message::SearchQueryChanged(q) => {
+                self.search_query = q;
+                self.recompute_search_matches();
+                if self.search_matches.is_empty() {
+                    self.search_index = None;
+                } else {
+                    self.search_index = Some(0);
+                    if let Some(cmd) = self.jump_to_search_match() {
+                        return cmd;
+                    }
+                }
+            }
+            Message::SearchCaseToggled(enabled) => {
+                self.search_case_sensitive = enabled;
+                self.recompute_search_matches();
+                if self.search_matches.is_empty() {
+                    self.search_index = None;
+                } else {
+                    self.search_index = Some(0);
+                    if let Some(cmd) = self.jump_to_search_match() {
+                        return cmd;
+                    }
+                }
+            }
+            Message::SearchNext => {
+                if !self.search_matches.is_empty() {
+                    let next = match self.search_index {
+                        Some(idx) => (idx + 1) % self.search_matches.len(),
+                        None => 0,
+                    };
+                    self.search_index = Some(next);
+                    if let Some(cmd) = self.jump_to_search_match() {
+                        return cmd;
+                    }
+                }
+            }
+            Message::SearchPrev => {
+                if !self.search_matches.is_empty() {
+                    let prev = match self.search_index {
+                        Some(0) | None => self.search_matches.len() - 1,
+                        Some(idx) => idx - 1,
+                    };
+                    self.search_index = Some(prev);
+                    if let Some(cmd) = self.jump_to_search_match() {
+                        return cmd;
+                    }
+                }
+            }
 
             Message::ConnectClicked => {
                 if let Some(cmd) = self.connect_from_fields() {
@@ -525,37 +779,15 @@ impl Application for ScopeGui {
             }
 
             Message::SendPressed => {
-                let raw = self.input.trim().to_string();
-                if raw.is_empty() {
-                    return iced::Command::none();
+                if let Some(cmd) = self.send_input(self.append_crlf) {
+                    return cmd;
                 }
+            }
 
-                self.input.clear();
-                self.history_index = None;
-
-                if self.history.last().map(|s| s.as_str()) != Some(raw.as_str()) {
-                    self.history.push(raw.clone());
+            Message::SendPressedNoCrlf => {
+                if let Some(cmd) = self.send_input(false) {
+                    return cmd;
                 }
-
-                if raw.starts_with('!') {
-                    if let Some(cmd) = self.handle_command(raw) {
-                        return cmd;
-                    }
-                    return iced::Command::none();
-                }
-
-                let mut bytes = Self::replace_hex_sequence(raw);
-                if self.append_crlf {
-                    bytes.extend_from_slice(b"\r\n");
-                }
-
-                let tx = self.cmd_tx.clone();
-                return iced::Command::perform(
-                    async move {
-                        let _ = tx.send(EngineCommand::SendBytes(bytes)).await;
-                    },
-                    |_| Message::InputChanged(String::new()),
-                );
             }
 
             Message::JumpToEnd => {
@@ -713,6 +945,34 @@ impl Application for ScopeGui {
                 .width(Length::Fixed(120.0)),
             button("Connect").on_press(Message::ConnectClicked),
             button("Disconnect").on_press(Message::DisconnectClicked),
+        ]
+        .spacing(12);
+
+        let serial_options = row![
+            text("Flow:"),
+            pick_list(
+                &FLOW_OPTIONS[..],
+                Some(self.flow_control),
+                Message::FlowControlChanged
+            ),
+            text("Data:"),
+            pick_list(
+                &DATA_OPTIONS[..],
+                Some(self.data_bits),
+                Message::DataBitsChanged
+            ),
+            text("Parity:"),
+            pick_list(
+                &PARITY_OPTIONS[..],
+                Some(self.parity),
+                Message::ParityChanged
+            ),
+            text("Stop:"),
+            pick_list(
+                &STOP_OPTIONS[..],
+                Some(self.stop_bits),
+                Message::StopBitsChanged
+            ),
             checkbox("Append CRLF", self.append_crlf).on_toggle(Message::AppendCrlfToggled),
             checkbox("Auto-scroll", self.auto_scroll).on_toggle(Message::AutoScrollToggled),
             button("Jump start").on_press(Message::JumpToStart),
@@ -723,34 +983,67 @@ impl Application for ScopeGui {
         ]
         .spacing(12);
 
+        let search_status = if self.search_matches.is_empty() {
+            "0/0".to_string()
+        } else {
+            let idx = self.search_index.map(|i| i + 1).unwrap_or(0);
+            format!("{}/{}", idx, self.search_matches.len())
+        };
+
+        let search_row = row![
+            text("Search:"),
+            text_input("Find...", &self.search_query)
+                .on_input(Message::SearchQueryChanged)
+                .width(Length::Fixed(220.0)),
+            checkbox("Case", self.search_case_sensitive).on_toggle(Message::SearchCaseToggled),
+            button("Prev").on_press(Message::SearchPrev),
+            button("Next").on_press(Message::SearchNext),
+            text(search_status),
+        ]
+        .spacing(12);
+
         let meta_color = iced::Color::from_rgb8(0x88, 0x88, 0x88);
         let monospace = iced::Font::MONOSPACE;
 
-        let log_column = self.log.iter().fold(column![], |c, line| {
-            let segs_row = line.segments.iter().fold(row![].spacing(0), |r, seg| {
-                let color = color_for(seg.color, seg.kind);
-                r.push(text(&seg.text).font(monospace).style(color))
+        let log_column = self
+            .log
+            .iter()
+            .enumerate()
+            .fold(column![], |c, (idx, line)| {
+                let segs_row = line.segments.iter().fold(row![].spacing(0), |r, seg| {
+                    let color = color_for(seg.color, seg.kind);
+                    r.push(text(&seg.text).font(monospace).style(color))
+                });
+
+                let mut prefix_color = match line.kind {
+                    LogKind::Rx => iced::Color::from_rgb8(0x7a, 0xd7, 0xf0),
+                    LogKind::Tx => iced::Color::from_rgb8(0x8a, 0xf7, 0xa6),
+                    LogKind::Sys => meta_color,
+                    LogKind::Err => iced::Color::from_rgb8(0xf2, 0x5f, 0x5c),
+                };
+
+                if self.search_matches.contains(&idx) {
+                    prefix_color = iced::Color::from_rgb8(0xE6, 0xC2, 0x2E);
+                }
+
+                if let Some(active) = self.search_index {
+                    if self.search_matches.get(active) == Some(&idx) {
+                        prefix_color = iced::Color::from_rgb8(0xF2, 0x5F, 0x5C);
+                    }
+                }
+
+                let prefix = format!("{:<5}", line.prefix);
+
+                c.push(
+                    row![
+                        text(&line.timestamp).font(monospace).style(meta_color),
+                        text(prefix).font(monospace).style(prefix_color),
+                        segs_row,
+                    ]
+                    .spacing(12)
+                    .width(Length::Shrink),
+                )
             });
-
-            let prefix_color = match line.kind {
-                LogKind::Rx => iced::Color::from_rgb8(0x7a, 0xd7, 0xf0),
-                LogKind::Tx => iced::Color::from_rgb8(0x8a, 0xf7, 0xa6),
-                LogKind::Sys => meta_color,
-                LogKind::Err => iced::Color::from_rgb8(0xf2, 0x5f, 0x5c),
-            };
-
-            let prefix = format!("{:<5}", line.prefix);
-
-            c.push(
-                row![
-                    text(&line.timestamp).font(monospace).style(meta_color),
-                    text(prefix).font(monospace).style(prefix_color),
-                    segs_row,
-                ]
-                .spacing(12)
-                .width(Length::Shrink),
-            )
-        });
 
         let log_view = scrollable(log_column)
             .id(self.log_scroll_id.clone())
@@ -771,10 +1064,17 @@ impl Application for ScopeGui {
         ]
         .spacing(12);
 
-        let content = column![header, controls, log_view, input]
-            .spacing(12)
-            .padding(16)
-            .height(Length::Fill);
+        let content = column![
+            header,
+            controls,
+            serial_options,
+            search_row,
+            log_view,
+            input
+        ]
+        .spacing(12)
+        .padding(16)
+        .height(Length::Fill);
 
         container(content)
             .width(Length::Fill)
