@@ -19,9 +19,7 @@ struct ScopeGui {
 }
 
 #[derive(Debug, Clone)]
-enum Message {
-    None,
-}
+enum Message {}
 
 impl Application for ScopeGui {
     type Executor = iced::executor::Default;
