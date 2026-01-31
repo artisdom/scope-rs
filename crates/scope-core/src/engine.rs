@@ -36,7 +36,9 @@ pub fn spawn() -> EngineHandle {
         let mut backoff_ms = 200u64;
         let mut next_retry = tokio::time::Instant::now();
 
-        let _ = evt_tx.send(EngineEvent::ConnectionState(state.clone())).await;
+        let _ = evt_tx
+            .send(EngineEvent::ConnectionState(state.clone()))
+            .await;
 
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(30));
 
@@ -47,7 +49,6 @@ pub fn spawn() -> EngineHandle {
                     match cmd {
                         EngineCommand::Connect(cfg) => {
                             desired = Some(cfg.clone());
-                            port = None;
                             state = ConnectionState::Connecting;
                             let _ = evt_tx.send(EngineEvent::ConnectionState(state.clone())).await;
                             match try_open(&cfg).with_context(|| format!("Failed to open serial port {} @ {}", cfg.port, cfg.baudrate)) {

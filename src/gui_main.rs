@@ -1,6 +1,7 @@
 #![deny(warnings)]
 
 mod gui_keyboard;
+#[allow(dead_code)]
 mod infra;
 
 use chrono::Local;
@@ -621,8 +622,12 @@ impl Application for ScopeGui {
                     self.push_system_info(format!("Content recorded on \"{}\"", filename));
                 } else {
                     match self.recorder.start_record() {
-                        Ok(_) => self.push_system_info(format!("Recording content on \"{}\"...", filename)),
-                        Err(err) => self.push_system_error(format!("Cannot start record on \"{}\": {}", filename, err)),
+                        Ok(_) => self
+                            .push_system_info(format!("Recording content on \"{}\"...", filename)),
+                        Err(err) => self.push_system_error(format!(
+                            "Cannot start record on \"{}\": {}",
+                            filename, err
+                        )),
                     }
                 }
             }
@@ -665,7 +670,9 @@ impl Application for ScopeGui {
                         kind: SegmentKind::Plain,
                         color: AnsiColor::Red,
                     }];
-                    if let Some(cmd) = self.add_log_line(LogKind::Err, Local::now(), "[ERR]", segments) {
+                    if let Some(cmd) =
+                        self.add_log_line(LogKind::Err, Local::now(), "[ERR]", segments)
+                    {
                         return cmd;
                     }
                 }

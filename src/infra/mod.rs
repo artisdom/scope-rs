@@ -7,6 +7,7 @@ pub mod task;
 pub mod timer;
 pub mod typewriter;
 
+#[allow(unused_imports)]
 pub use logger::LogLevel;
 
 fn into_byte_format(size: u128) -> String {

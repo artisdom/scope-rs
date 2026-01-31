@@ -1,11 +1,11 @@
-use iced::Event;
-use iced::Subscription;
 use iced::keyboard;
 use iced::keyboard::Key;
+use iced::Event;
+use iced::Subscription;
+use iced_core::Hasher;
 use iced_futures::subscription::{EventStream, Recipe};
 use iced_futures::BoxStream;
 use std::hash::Hash;
-use iced_core::Hasher;
 
 #[derive(Debug, Clone)]
 pub enum Shortcut {
@@ -32,14 +32,15 @@ impl Recipe for ShortcutRecipe {
     fn stream(self: Box<Self>, input: EventStream) -> BoxStream<Self::Output> {
         use iced::futures::StreamExt;
 
-        Box::pin(input.filter_map(|(event, _status)| {
-            iced::futures::future::ready(match event {
+        Box::pin(input.filter_map(|(event, _status)| async move {
+            match event {
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     let key = key.as_ref();
                     if matches!(key, Key::Named(keyboard::key::Named::End)) && modifiers.control() {
                         return Some(Shortcut::JumpToEnd);
                     }
-                    if matches!(key, Key::Named(keyboard::key::Named::Home)) && modifiers.control() {
+                    if matches!(key, Key::Named(keyboard::key::Named::Home)) && modifiers.control()
+                    {
                         return Some(Shortcut::JumpToStart);
                     }
                     if matches!(key, Key::Named(keyboard::key::Named::PageUp)) {
@@ -66,7 +67,7 @@ impl Recipe for ShortcutRecipe {
                     None
                 }
                 _ => None,
-            })
+            }
         }))
     }
 }
