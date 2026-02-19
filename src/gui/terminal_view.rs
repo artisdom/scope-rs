@@ -511,9 +511,16 @@ impl TerminalView {
                     let mut col = column![input_row];
                     if let Some(hex) = mux_frame_hex {
                         col = col.push(
-                            text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
-                                color: Some(ACCENT_COLOR) 
-                            })
+                            row![
+                                text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
+                                    color: Some(ACCENT_COLOR) 
+                                }),
+                                button("📋")
+                                    .on_press(Message::CopyMuxFrame(hex))
+                                    .style(button_style)
+                                    .padding(Padding::new(2.0)),
+                            ]
+                            .spacing(5)
                         );
                     }
                     
@@ -612,9 +619,16 @@ impl TerminalView {
                     
                     if let Some(hex) = mux_frame_hex {
                         col = col.push(
-                            text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
-                                color: Some(ACCENT_COLOR) 
-                            })
+                            row![
+                                text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
+                                    color: Some(ACCENT_COLOR) 
+                                }),
+                                button("📋")
+                                    .on_press(Message::CopyMuxFrame(hex))
+                                    .style(button_style)
+                                    .padding(Padding::new(2.0)),
+                            ]
+                            .spacing(5)
                         );
                     }
                     

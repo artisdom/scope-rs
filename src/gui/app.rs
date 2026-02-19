@@ -475,6 +475,10 @@ pub fn update(app: &mut ScopeApp, message: Message) -> Task<Message> {
                 app.terminal_view.mux_link_id = id;
             }
         }
+        Message::CopyMuxFrame(hex) => {
+            // Copy to clipboard
+            return iced::clipboard::write(hex);
+        }
         
         // Search
         Message::ToggleSearchMode => {

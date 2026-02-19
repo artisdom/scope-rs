@@ -53,6 +53,7 @@ pub enum Message {
     // Multiplexing protocol mode
     ToggleMuxMode,
     MuxLinkIdChanged(String),
+    CopyMuxFrame(String),
     
     // Search
     ToggleSearchMode,
