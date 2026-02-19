@@ -515,7 +515,7 @@ impl TerminalView {
                                 text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
                                     color: Some(ACCENT_COLOR) 
                                 }),
-                                button("📋")
+                                button("Copy")
                                     .on_press(Message::CopyMuxFrame(hex))
                                     .style(button_style)
                                     .padding(Padding::new(2.0)),
@@ -623,7 +623,7 @@ impl TerminalView {
                                 text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
                                     color: Some(ACCENT_COLOR) 
                                 }),
-                                button("📋")
+                                button("Copy")
                                     .on_press(Message::CopyMuxFrame(hex))
                                     .style(button_style)
                                     .padding(Padding::new(2.0)),
