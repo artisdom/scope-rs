@@ -66,6 +66,44 @@ impl HexByte {
     }
 }
 
+/// Multiplexing protocol encoder
+/// 
+/// Frame format:
+/// | 8 bits  | SOF    | Start of frame              | 0xBF                        |
+/// | 8 bits  | LINK   | Link ID                     | 0x00-0x06 or 0xFF (control) |
+/// | 6 bits  | FLAGS  | Frame flags                 | 0x00                        |
+/// | 10 bits | LENGTH | Size of data field in bytes |                             |
+/// | N bytes | DATA   | Data                        |                             |
+/// | 8 bits  | nLINK  | LINK XOR 0xFF               |                             |
+pub fn encode_mux_frame(data: &[u8], link_id: u8) -> Vec<u8> {
+    const SOF: u8 = 0xBF;
+    const MAX_DATA_LEN: usize = 1023;
+    
+    let data_len = data.len().min(MAX_DATA_LEN);
+    let flags: u16 = 0;
+    let length_field: u16 = (flags << 10) | (data_len as u16 & 0x03FF);
+    
+    let mut frame = Vec::with_capacity(5 + data_len);
+    
+    // SOF
+    frame.push(SOF);
+    
+    // LINK
+    frame.push(link_id);
+    
+    // FLAGS (6 bits) + LENGTH (10 bits), big-endian
+    frame.push((length_field >> 8) as u8);
+    frame.push((length_field & 0xFF) as u8);
+    
+    // DATA
+    frame.extend_from_slice(&data[..data_len]);
+    
+    // nLINK = LINK XOR 0xFF
+    frame.push(link_id ^ 0xFF);
+    
+    frame
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TerminalView {
     pub lines: VecDeque<TerminalLine>,
@@ -83,6 +121,11 @@ pub struct TerminalView {
     pub hex_bytes: Vec<HexByte>,
     pub hex_input_buffer: String,
     pub hex_error: Option<String>,
+    
+    // Multiplexing protocol mode
+    pub mux_mode: bool,
+    pub mux_link_id: u8,
+    pub mux_link_id_input: String,
 }
 
 impl TerminalView {
@@ -100,6 +143,9 @@ impl TerminalView {
             hex_bytes: Vec::new(),
             hex_input_buffer: String::new(),
             hex_error: None,
+            mux_mode: false,
+            mux_link_id: 0xFF,
+            mux_link_id_input: "FF".to_string(),
         }
     }
 
@@ -397,22 +443,72 @@ impl TerminalView {
             ]
             .spacing(5);
             
+            // Multiplexing protocol mode toggle
+            let mux_toggle = row![
+                text("MUX")
+                    .style(move |_theme| text::Style { 
+                        color: if self.mux_mode { Some(ACCENT_COLOR) } else { Some(iced::Color::from_rgb(0.5, 0.5, 0.5)) }
+                    })
+                    .size(12),
+                toggler(self.mux_mode)
+                    .on_toggle(|_| Message::ToggleMuxMode),
+            ]
+            .spacing(5);
+            
+            // Link ID input (only visible when MUX mode is enabled)
+            let link_id_input = if self.mux_mode {
+                Some(row![
+                    text("Link:").size(12),
+                    text_input("FF", &self.mux_link_id_input)
+                        .on_input(Message::MuxLinkIdChanged)
+                        .width(Length::Fixed(50.0))
+                        .style(text_input_style),
+                ]
+                .spacing(5))
+            } else {
+                None
+            };
+            
+            // MUX info display
+            let mux_info = if self.mux_mode {
+                format!(" [MUX:0x{:02X}]", self.mux_link_id)
+            } else {
+                String::new()
+            };
+            
             match self.input_mode {
                 InputMode::Ascii => {
-                    column![
-                        row![
-                            mode_toggle,
+                    let mut input_row = row![
+                        mode_toggle,
+                        mux_toggle,
+                    ];
+                    input_row = input_row.spacing(10);
+                    
+                    if let Some(link_input) = link_id_input {
+                        input_row = input_row.push(link_input);
+                    }
+                    
+                    input_row = input_row
+                        .push(
                             text_input("Enter command...", &self.input_buffer)
                                 .on_input(Message::TerminalInput)
                                 .on_submit(Message::SendCommand)
                                 .style(text_input_style)
-                                .width(Length::Fill),
+                                .width(Length::Fill)
+                        )
+                        .push(
                             button("Send")
                                 .on_press(Message::SendCommand)
-                                .style(primary_button_style),
-                        ]
-                        .spacing(10)
+                                .style(primary_button_style)
+                        );
+                    
+                    column![
+                        input_row,
+                        text(mux_info).size(10).style(|_theme| text::Style { 
+                            color: Some(ACCENT_COLOR) 
+                        }),
                     ]
+                    .spacing(5)
                     .into()
                 }
                 InputMode::Hex => {
@@ -455,19 +551,32 @@ impl TerminalView {
                     ]
                     .spacing(5);
                     
-                    column![
-                        row![
-                            mode_toggle,
+                    let mut input_row = row![
+                        mode_toggle,
+                        mux_toggle,
+                    ];
+                    input_row = input_row.spacing(10);
+                    
+                    if let Some(link_input) = link_id_input {
+                        input_row = input_row.push(link_input);
+                    }
+                    
+                    input_row = input_row
+                        .push(
                             text_input("Type hex (e.g., 48656C6C6F)...", &self.hex_input_buffer)
                                 .on_input(Message::HexInput)
                                 .on_submit(Message::SendCommand)
                                 .style(text_input_style)
-                                .width(Length::Fill),
+                                .width(Length::Fill)
+                        )
+                        .push(
                             button("Send")
                                 .on_press(Message::SendCommand)
-                                .style(primary_button_style),
-                        ]
-                        .spacing(10),
+                                .style(primary_button_style)
+                        );
+                    
+                    column![
+                        input_row,
                         row![
                             text("Bytes: ").size(12),
                             text(hex_display).size(12).style(|_theme| text::Style { 
@@ -475,6 +584,9 @@ impl TerminalView {
                             }),
                             text("  |  ").size(12),
                             text(preview).size(12),
+                            text(mux_info).size(12).style(|_theme| text::Style { 
+                                color: Some(ACCENT_COLOR) 
+                            }),
                         ]
                         .spacing(5),
                         row![

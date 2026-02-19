@@ -50,6 +50,10 @@ pub enum Message {
     QuickHex(String),
     ClearHexInput,
     
+    // Multiplexing protocol mode
+    ToggleMuxMode,
+    MuxLinkIdChanged(String),
+    
     // Search
     ToggleSearchMode,
     SearchInput(String),

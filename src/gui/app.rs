@@ -226,6 +226,14 @@ impl ScopeApp {
                     return;
                 }
                 
+                // Prepare data to send
+                let data = format!("{}\n", command).into_bytes();
+                let send_data = if self.terminal_view.mux_mode {
+                    super::terminal_view::encode_mux_frame(&data, self.terminal_view.mux_link_id)
+                } else {
+                    data
+                };
+                
                 // Add to terminal view
                 self.terminal_view.add_sent_data(
                     &format!("{}\n", command),
@@ -237,7 +245,7 @@ impl ScopeApp {
                     let producer = Arc::clone(tx).new_producer();
                     producer.produce(Arc::new(TimedBytes {
                         timestamp: Local::now(),
-                        message: format!("{}\n", command).into_bytes(),
+                        message: send_data,
                     }));
                 }
                 
@@ -250,6 +258,13 @@ impl ScopeApp {
                     return;
                 }
                 
+                // Prepare data to send
+                let send_data = if self.terminal_view.mux_mode {
+                    super::terminal_view::encode_mux_frame(&bytes, self.terminal_view.mux_link_id)
+                } else {
+                    bytes.clone()
+                };
+                
                 // Add to terminal view
                 self.terminal_view.add_sent_bytes(
                     &bytes,
@@ -261,7 +276,7 @@ impl ScopeApp {
                     let producer = Arc::clone(tx).new_producer();
                     producer.produce(Arc::new(TimedBytes {
                         timestamp: Local::now(),
-                        message: bytes,
+                        message: send_data,
                     }));
                 }
                 
@@ -447,6 +462,18 @@ pub fn update(app: &mut ScopeApp, message: Message) -> Task<Message> {
         }
         Message::ClearHexInput => {
             app.terminal_view.clear_hex();
+        }
+        
+        // Multiplexing protocol mode
+        Message::ToggleMuxMode => {
+            app.terminal_view.mux_mode = !app.terminal_view.mux_mode;
+        }
+        Message::MuxLinkIdChanged(s) => {
+            app.terminal_view.mux_link_id_input = s.clone();
+            // Parse hex value
+            if let Ok(id) = u8::from_str_radix(&s.trim().trim_start_matches("0x"), 16) {
+                app.terminal_view.mux_link_id = id;
+            }
         }
         
         // Search
