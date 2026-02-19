@@ -469,15 +469,21 @@ impl TerminalView {
                 None
             };
             
-            // MUX info display
-            let mux_info = if self.mux_mode {
-                format!(" [MUX:0x{:02X}]", self.mux_link_id)
-            } else {
-                String::new()
-            };
-            
             match self.input_mode {
                 InputMode::Ascii => {
+                    // MUX packet preview for ASCII mode
+                    let mux_frame_hex = if self.mux_mode && !self.input_buffer.is_empty() {
+                        let data = format!("{}\n", self.input_buffer).into_bytes();
+                        let frame = encode_mux_frame(&data, self.mux_link_id);
+                        let hex: String = frame.iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Some(hex)
+                    } else {
+                        None
+                    };
+                    
                     let mut input_row = row![
                         mode_toggle,
                         mux_toggle,
@@ -502,14 +508,16 @@ impl TerminalView {
                                 .style(primary_button_style)
                         );
                     
-                    column![
-                        input_row,
-                        text(mux_info).size(10).style(|_theme| text::Style { 
-                            color: Some(ACCENT_COLOR) 
-                        }),
-                    ]
-                    .spacing(5)
-                    .into()
+                    let mut col = column![input_row];
+                    if let Some(hex) = mux_frame_hex {
+                        col = col.push(
+                            text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
+                                color: Some(ACCENT_COLOR) 
+                            })
+                        );
+                    }
+                    
+                    col.spacing(5).into()
                 }
                 InputMode::Hex => {
                     // Hex input display
@@ -518,11 +526,13 @@ impl TerminalView {
                         .collect::<Vec<_>>()
                         .join(" ");
                     
+                    // Get hex bytes once for reuse
+                    let bytes: Vec<u8> = self.get_hex_bytes();
+                    
                     // Preview of bytes to send with ASCII representation
-                    let preview = if self.hex_bytes.is_empty() {
+                    let preview = if bytes.is_empty() {
                         "No bytes".to_string()
                     } else {
-                        let bytes: Vec<u8> = self.get_hex_bytes();
                         let ascii: String = bytes.iter()
                             .map(|&b| {
                                 if b >= 0x20 && b <= 0x7E {
@@ -575,7 +585,19 @@ impl TerminalView {
                                 .style(primary_button_style)
                         );
                     
-                    column![
+                    // MUX packet preview for Hex mode
+                    let mux_frame_hex = if self.mux_mode && !bytes.is_empty() {
+                        let frame = encode_mux_frame(&bytes, self.mux_link_id);
+                        let hex: String = frame.iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Some(hex)
+                    } else {
+                        None
+                    };
+                    
+                    let mut col = column![
                         input_row,
                         row![
                             text("Bytes: ").size(12),
@@ -584,19 +606,27 @@ impl TerminalView {
                             }),
                             text("  |  ").size(12),
                             text(preview).size(12),
-                            text(mux_info).size(12).style(|_theme| text::Style { 
-                                color: Some(ACCENT_COLOR) 
-                            }),
                         ]
                         .spacing(5),
+                    ];
+                    
+                    if let Some(hex) = mux_frame_hex {
+                        col = col.push(
+                            text(format!("MUX Frame: {}", hex)).size(10).style(|_theme| text::Style { 
+                                color: Some(ACCENT_COLOR) 
+                            })
+                        );
+                    }
+                    
+                    col = col.push(
                         row![
                             quick_buttons,
                             error_display,
                         ]
-                        .spacing(10),
-                    ]
-                    .spacing(5)
-                    .into()
+                        .spacing(10)
+                    );
+                    
+                    col.spacing(5).into()
                 }
             }
         };
