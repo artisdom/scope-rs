@@ -422,12 +422,21 @@ impl TerminalView {
                         .collect::<Vec<_>>()
                         .join(" ");
                     
-                    // Preview of bytes to send
+                    // Preview of bytes to send with ASCII representation
                     let preview = if self.hex_bytes.is_empty() {
                         "No bytes".to_string()
                     } else {
                         let bytes: Vec<u8> = self.get_hex_bytes();
-                        format!("{} byte(s): {:?}", bytes.len(), bytes)
+                        let ascii: String = bytes.iter()
+                            .map(|&b| {
+                                if b >= 0x20 && b <= 0x7E {
+                                    char::from(b)
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect();
+                        format!("{} byte(s): {:?}  ASCII: \"{}\"", bytes.len(), bytes, ascii)
                     };
                     
                     // Error display
