@@ -219,27 +219,56 @@ impl ScopeApp {
     }
     
     fn send_command(&mut self) {
-        let command = self.terminal_view.input_buffer.clone();
-        if command.is_empty() {
-            return;
+        match self.terminal_view.input_mode {
+            super::terminal_view::InputMode::Ascii => {
+                let command = self.terminal_view.input_buffer.clone();
+                if command.is_empty() {
+                    return;
+                }
+                
+                // Add to terminal view
+                self.terminal_view.add_sent_data(
+                    &format!("{}\n", command),
+                    Some(Local::now().format("%H:%M:%S").to_string()),
+                );
+                
+                // Send to serial
+                if let Some(ref tx) = self.tx_channel {
+                    let producer = Arc::clone(tx).new_producer();
+                    producer.produce(Arc::new(TimedBytes {
+                        timestamp: Local::now(),
+                        message: format!("{}\n", command).into_bytes(),
+                    }));
+                }
+                
+                self.terminal_view.input_buffer.clear();
+            }
+            super::terminal_view::InputMode::Hex => {
+                // Parse hex input
+                let bytes = self.terminal_view.get_hex_bytes();
+                if bytes.is_empty() {
+                    return;
+                }
+                
+                // Add to terminal view
+                self.terminal_view.add_sent_bytes(
+                    &bytes,
+                    Some(Local::now().format("%H:%M:%S").to_string()),
+                );
+                
+                // Send to serial
+                if let Some(ref tx) = self.tx_channel {
+                    let producer = Arc::clone(tx).new_producer();
+                    producer.produce(Arc::new(TimedBytes {
+                        timestamp: Local::now(),
+                        message: bytes,
+                    }));
+                }
+                
+                self.terminal_view.clear_hex();
+            }
         }
         
-        // Add to terminal view
-        self.terminal_view.add_sent_data(
-            &format!("{}\n", command),
-            Some(Local::now().format("%H:%M:%S").to_string()),
-        );
-        
-        // Send to serial
-        if let Some(ref tx) = self.tx_channel {
-            let producer = Arc::clone(tx).new_producer();
-            producer.produce(Arc::new(TimedBytes {
-                timestamp: Local::now(),
-                message: format!("{}\n", command).into_bytes(),
-            }));
-        }
-        
-        self.terminal_view.input_buffer.clear();
         self.history_len += 1;
     }
     
@@ -380,6 +409,44 @@ pub fn update(app: &mut ScopeApp, message: Message) -> Task<Message> {
         Message::ScrollUp | Message::ScrollDown | Message::PageUp | Message::PageDown 
         | Message::JumpToStart | Message::JumpToEnd => {
             // Handle scrolling in terminal view
+        }
+        
+        // Input mode switching
+        Message::SwitchToAsciiMode => {
+            app.terminal_view.input_mode = super::terminal_view::InputMode::Ascii;
+            app.terminal_view.clear_hex();
+        }
+        Message::SwitchToHexMode => {
+            app.terminal_view.input_mode = super::terminal_view::InputMode::Hex;
+            app.terminal_view.input_buffer.clear();
+        }
+        Message::HexInput(s) => {
+            app.terminal_view.hex_input_buffer = s.clone();
+            // Parse and update hex bytes
+            if let Some(bytes) = app.terminal_view.parse_hex_string(&s) {
+                app.terminal_view.hex_bytes = bytes.iter()
+                    .map(|b| super::terminal_view::HexByte { 
+                        high: Some(format!("{:X}", b >> 4).chars().next().unwrap()),
+                        low: Some(format!("{:X}", b & 0x0F).chars().next().unwrap()),
+                    })
+                    .collect();
+            }
+        }
+        Message::QuickHex(hex) => {
+            // Add quick hex bytes
+            app.terminal_view.hex_input_buffer.push_str(&hex);
+            let buffer = app.terminal_view.hex_input_buffer.clone();
+            if let Some(bytes) = app.terminal_view.parse_hex_string(&buffer) {
+                app.terminal_view.hex_bytes = bytes.iter()
+                    .map(|b| super::terminal_view::HexByte { 
+                        high: Some(format!("{:X}", b >> 4).chars().next().unwrap()),
+                        low: Some(format!("{:X}", b & 0x0F).chars().next().unwrap()),
+                    })
+                    .collect();
+            }
+        }
+        Message::ClearHexInput => {
+            app.terminal_view.clear_hex();
         }
         
         // Search

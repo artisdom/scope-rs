@@ -43,6 +43,13 @@ pub enum Message {
     JumpToStart,
     JumpToEnd,
     
+    // Input mode switching
+    SwitchToAsciiMode,
+    SwitchToHexMode,
+    HexInput(String),
+    QuickHex(String),
+    ClearHexInput,
+    
     // Search
     ToggleSearchMode,
     SearchInput(String),
