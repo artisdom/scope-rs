@@ -1,5 +1,5 @@
 use serialport::{SerialPortInfo, SerialPortType};
-use std::{fmt::Display, iter::zip};
+use std::fmt::Display;
 
 enum Alignment {
     Left,
@@ -67,7 +67,9 @@ impl<const N: usize> Table<N> {
     }
 
     pub fn add_row(&mut self, fields: [String; N]) {
-        zip(self.columns.as_mut(), fields).for_each(|(column, field)| column.add_field(field));
+        for (column, field) in self.columns.iter_mut().zip(fields.iter()) {
+            column.add_field(field.clone());
+        }
     }
 
     pub fn number_of_rows(&self) -> usize {

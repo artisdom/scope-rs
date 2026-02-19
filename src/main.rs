@@ -3,6 +3,7 @@
 extern crate core;
 
 mod graphics;
+mod gui;
 mod infra;
 mod inputs;
 mod list;
@@ -31,7 +32,10 @@ const DEFAULT_TAG_FILE: &str = "tags.yml";
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+    /// Launch GUI mode (default if no subcommand is provided)
+    #[clap(short, long)]
+    gui: bool,
     #[clap(short, long)]
     capacity: Option<usize>,
     #[clap(short, long)]
@@ -42,18 +46,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Start serial monitor in CLI mode (TUI)
     Serial {
         port: Option<String>,
         baudrate: Option<u32>,
     },
+    /// List available serial ports
     List {
         #[clap(short, long)]
         verbose: bool,
     },
+    /// BLE connection (not yet implemented)
     Ble {
         name_device: String,
         mtu: u32,
     },
+    /// Launch GUI mode
+    Gui,
 }
 
 fn app(
@@ -181,32 +190,44 @@ fn main() -> Result<(), String> {
 
     let cli = Cli::parse();
 
-    let (port, baudrate) = match cli.command {
-        Commands::Serial { port, baudrate } => (port, baudrate),
-        Commands::Ble { .. } => {
+    let capacity = cli.capacity.unwrap_or(DEFAULT_CAPACITY);
+    let tag_file = cli.tag_file.unwrap_or(PathBuf::from(DEFAULT_TAG_FILE));
+    let latency = cli.latency.unwrap_or(500).clamp(0, 100_000);
+
+    // Determine if we should run in GUI mode
+    let run_gui = cli.gui || matches!(cli.command, Some(Commands::Gui)) || cli.command.is_none();
+
+    if run_gui {
+        // Launch GUI mode
+        let setup = SerialSetup::default();
+        if let Err(e) = gui::app::run_gui(setup, capacity, tag_file, latency) {
+            eprintln!("[\x1b[31mERR\x1b[0m] GUI error: {}", e);
+            exit(1);
+        }
+        return Ok(());
+    }
+
+    // CLI mode
+    match cli.command {
+        Some(Commands::Serial { port, baudrate }) => {
+            if let Err(err) = app(capacity, tag_file, port, baudrate, latency) {
+                eprintln!("[\x1b[31mERR\x1b[0m] {}", err);
+                exit(1);
+            }
+            println!("See you later ^^");
+        }
+        Some(Commands::Ble { .. }) => {
             return Err(
                 "Sorry! We're developing BLE interface and it's not available yet".to_string(),
             );
         }
-        Commands::List { verbose } => {
+        Some(Commands::List { verbose }) => {
             return list_serial_ports(verbose);
         }
-    };
-
-    let capacity = cli.capacity.unwrap_or(DEFAULT_CAPACITY);
-    let tag_file = cli.tag_file.unwrap_or(PathBuf::from(DEFAULT_TAG_FILE));
-
-    if let Err(err) = app(
-        capacity,
-        tag_file,
-        port,
-        baudrate,
-        cli.latency.unwrap_or(500).clamp(0, 100_000),
-    ) {
-        eprintln!("[\x1b[31mERR\x1b[0m] {}", err);
-        exit(1);
+        Some(Commands::Gui) | None => {
+            // Already handled above
+        }
     }
 
-    println!("See you later ^^");
     Ok(())
 }
