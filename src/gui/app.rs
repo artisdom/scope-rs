@@ -9,7 +9,7 @@ use super::styles::{
 use super::terminal_view::TerminalView;
 use crate::infra::logger::Logger;
 use crate::infra::messages::TimedBytes;
-use crate::infra::mpmc::Channel;
+use crate::infra::mpmc::{Channel, Consumer};
 use crate::plugin::engine::{PluginEngine, PluginEngineConnections, PluginEngineCommand};
 use crate::serial::serial_if::{
     SerialCommand, SerialConnections, SerialInterface, SerialMode, SerialSetup, SerialShared,
@@ -46,6 +46,7 @@ pub struct ScopeApp {
     serial_shared: Option<Shared<SerialShared>>,
     tx_channel: Option<Arc<Channel<Arc<TimedBytes>>>>,
     rx_channel: Option<Arc<Channel<Arc<TimedBytes>>>>,
+    rx_consumer: Option<Consumer<Arc<TimedBytes>>>,
     plugin_engine: Option<PluginEngine>,
     
     // Channels for communication
@@ -91,6 +92,7 @@ impl ScopeApp {
             serial_shared: None,
             tx_channel: None,
             rx_channel: None,
+            rx_consumer: None,
             plugin_engine: None,
             serial_cmd_sender: None,
             plugin_cmd_sender: None,
@@ -116,7 +118,7 @@ impl ScopeApp {
         let tx_consumer2 = tx_channel.new_consumer();
         let _tx_consumer3 = tx_channel.new_consumer();
         let rx_consumer = rx_channel.new_consumer();
-        let _rx_consumer2 = rx_channel.new_consumer();
+        let rx_consumer_gui = rx_channel.new_consumer();  // GUI consumer for receiving data
         
         let tx_channel = Arc::new(tx_channel);
         let rx_channel = Arc::new(rx_channel);
@@ -166,6 +168,7 @@ impl ScopeApp {
         self.serial_shared = Some(serial_shared);
         self.tx_channel = Some(tx_channel);
         self.rx_channel = Some(rx_channel);
+        self.rx_consumer = Some(rx_consumer_gui);  // Store GUI consumer
         self.plugin_engine = Some(plugin_engine);
         self.serial_cmd_sender = Some(serial_cmd_sender);
         self.plugin_cmd_sender = Some(plugin_cmd_sender);
@@ -532,6 +535,15 @@ pub fn update(app: &mut ScopeApp, message: Message) -> Task<Message> {
         }
         Message::Tick => {
             app.update_connection_status();
+            // Poll for received data
+            if let Some(ref consumer) = app.rx_consumer {
+                while let Ok(data) = consumer.try_recv() {
+                    app.terminal_view.add_received_data(
+                        &data.message,
+                        Some(data.timestamp.format("%H:%M:%S").to_string()),
+                    );
+                }
+            }
         }
         Message::DataReceived(data) => {
             app.terminal_view.add_received_data(
