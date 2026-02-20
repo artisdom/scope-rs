@@ -157,7 +157,18 @@ impl TerminalView {
     }
 
     pub fn add_received_data(&mut self, data: &[u8], timestamp: Option<String>) {
-        let content = String::from_utf8_lossy(data).to_string();
+        // Format bytes similar to CLI version: show ASCII when printable, hex otherwise
+        let content: String = data
+            .iter()
+            .map(|&b| match b {
+                b'\n' => "\\n".to_string(),
+                b'\r' => "\\r".to_string(),
+                b'\t' => "\\t".to_string(),
+                b if (0x20..=0x7e).contains(&b) => (b as char).to_string(),
+                _ => format!("\\x{:02x}", b),
+            })
+            .collect();
+        
         for line in content.lines() {
             self.add_line(TerminalLine {
                 content: line.to_string(),
