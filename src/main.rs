@@ -3,6 +3,7 @@
 extern crate core;
 
 mod graphics;
+mod gui;
 mod infra;
 mod inputs;
 mod interfaces;
@@ -61,6 +62,7 @@ pub enum Commands {
         target: Option<String>,
         channel_num: Option<usize>,
     },
+    Gui,
 }
 
 fn app_serial(
@@ -330,6 +332,7 @@ fn main() -> Result<(), String> {
             target,
             channel_num,
         } => app_rtt(capacity, tag_file, target, channel_num, latency),
+        Commands::Gui => gui::run_gui(),
     };
 
     if let Err(err) = result {
