@@ -35,7 +35,7 @@ const DEFAULT_TAG_FILE: &str = "tags.yml";
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
     #[clap(short, long)]
     capacity: Option<usize>,
     #[clap(short, long)]
@@ -320,7 +320,7 @@ fn main() -> Result<(), String> {
     let tag_file = cli.tag_file.unwrap_or(PathBuf::from(DEFAULT_TAG_FILE));
     let latency = cli.latency.unwrap_or(100).clamp(0, 100_000);
 
-    let result = match cli.command {
+    let result = match cli.command.unwrap_or(Commands::Gui) {
         Commands::Serial { port, baudrate } => {
             app_serial(capacity, tag_file, port, baudrate, latency)
         }

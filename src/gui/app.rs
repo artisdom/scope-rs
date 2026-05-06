@@ -1,6 +1,7 @@
 use chrono::{DateTime, Local};
-use egui::{Color32, Key, RichText, ScrollArea, TextStyle};
+use egui::{Color32, Key, Modifiers, RichText, ScrollArea, TextStyle};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::serial_worker::{
@@ -95,6 +96,8 @@ pub struct GuiApp {
     show_timestamps: bool,
     auto_scroll: bool,
     show_tx_in_log: bool,
+    require_ctrl_enter_to_send: bool,
+    visuals_initialized: bool,
 
     bytes_rx: u64,
     bytes_tx: u64,
@@ -131,6 +134,8 @@ impl GuiApp {
             show_timestamps: true,
             auto_scroll: true,
             show_tx_in_log: true,
+            require_ctrl_enter_to_send: false,
+            visuals_initialized: false,
             bytes_rx: 0,
             bytes_tx: 0,
             status: "Idle".to_string(),
@@ -423,12 +428,51 @@ impl GuiApp {
             ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
             ui.checkbox(&mut self.show_tx_in_log, "Echo TX");
             ui.separator();
+            if ui.button("Save…").on_hover_text("Save log to current directory (Ctrl+S)").clicked() {
+                self.save_log_to_timestamped_file();
+            }
             if ui.button("Clear").clicked() {
                 self.entries.clear();
                 self.bytes_rx = 0;
                 self.bytes_tx = 0;
             }
         });
+    }
+
+    fn save_log_to_timestamped_file(&mut self) {
+        let filename = format!("{}.txt", Local::now().format("%Y%m%d_%H%M%S"));
+        let path = PathBuf::from(&filename);
+        let mut content = String::new();
+        for entry in &self.entries {
+            let ts = format!("[{}] ", entry.timestamp.format("%Y-%m-%d %H:%M:%S%.3f"));
+            let prefix = match entry.kind {
+                EntryKind::Rx => "RX ",
+                EntryKind::Tx => "TX ",
+                EntryKind::System => "-- ",
+                EntryKind::SystemError => "!! ",
+            };
+            let body = match entry.kind {
+                EntryKind::System | EntryKind::SystemError => {
+                    entry.message.clone().unwrap_or_default()
+                }
+                EntryKind::Rx | EntryKind::Tx => format_bytes(&entry.bytes, self.display_mode),
+            };
+            content.push_str(&ts);
+            content.push_str(prefix);
+            content.push_str(&body);
+            content.push('\n');
+        }
+        match std::fs::write(&path, content) {
+            Ok(()) => {
+                let abs = std::fs::canonicalize(&path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| filename.clone());
+                self.push_system(format!("Saved log to {}", abs));
+            }
+            Err(e) => {
+                self.push_system_error(format!("Failed to save log to {}: {}", filename, e));
+            }
+        }
     }
 
     fn log_view(&self, ui: &mut egui::Ui) {
@@ -452,10 +496,10 @@ impl GuiApp {
         };
 
         let (prefix, color) = match entry.kind {
-            EntryKind::Rx => ("← ", Color32::from_rgb(180, 220, 255)),
-            EntryKind::Tx => ("→ ", Color32::from_rgb(180, 255, 180)),
-            EntryKind::System => ("· ", Color32::from_rgb(160, 160, 160)),
-            EntryKind::SystemError => ("! ", Color32::from_rgb(255, 120, 120)),
+            EntryKind::Rx => ("← ", Color32::from_rgb(10, 60, 170)),
+            EntryKind::Tx => ("→ ", Color32::from_rgb(15, 110, 35)),
+            EntryKind::System => ("· ", Color32::from_rgb(80, 80, 80)),
+            EntryKind::SystemError => ("! ", Color32::from_rgb(190, 30, 30)),
         };
 
         let body = match entry.kind {
@@ -489,10 +533,12 @@ impl GuiApp {
                     }
                 });
             ui.separator();
-            ui.label(
-                RichText::new("Ctrl+Enter to send")
-                    .small()
-                    .color(Color32::GRAY),
+            ui.checkbox(
+                &mut self.require_ctrl_enter_to_send,
+                "Require Ctrl+Enter to send",
+            )
+            .on_hover_text(
+                "Off: plain Enter sends. On: Enter inserts a newline; Ctrl+Enter sends.",
             );
         });
 
@@ -503,17 +549,25 @@ impl GuiApp {
                 SendMode::Ascii => "Type text to send...",
                 SendMode::Hex => "Hex bytes, e.g. A0 B1 0F or A0B10F",
             };
-            let resp = ui.add(
+            let edit_id = egui::Id::new("send_input_edit");
+            let edit_focused = ui.ctx().memory(|m| m.has_focus(edit_id));
+
+            let plain_enter_pressed = edit_focused
+                && !self.require_ctrl_enter_to_send
+                && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+            let ctrl_enter_pressed = edit_focused
+                && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+
+            ui.add(
                 egui::TextEdit::multiline(&mut self.send_input)
+                    .id(edit_id)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .hint_text(hint)
                     .font(TextStyle::Monospace),
             );
 
-            let send_with_ctrl_enter = resp.has_focus()
-                && ui.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Enter));
-            if send_with_ctrl_enter {
+            if plain_enter_pressed || ctrl_enter_pressed {
                 self.try_send();
             }
         });
@@ -562,6 +616,15 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.visuals_initialized {
+            ctx.set_visuals(egui::Visuals::light());
+            self.visuals_initialized = true;
+        }
+
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
+            self.save_log_to_timestamped_file();
+        }
+
         if self.last_port_refresh.elapsed() >= PORT_REFRESH_INTERVAL && !self.connected {
             self.refresh_ports();
             self.last_port_refresh = Instant::now();
@@ -681,7 +744,7 @@ fn format_ascii(bytes: &[u8]) -> String {
     for &b in bytes {
         match b {
             b'\r' => out.push_str("\\r"),
-            b'\n' => {}
+            b'\n' => out.push_str("\\n"),
             0x09 => out.push('\t'),
             0x20..=0x7E => out.push(b as char),
             _ => out.push_str(&format!("\\x{:02X}", b)),
