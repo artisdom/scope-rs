@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local};
-use egui::{Color32, Key, Modifiers, RichText, ScrollArea, TextStyle};
+use egui::{Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, ScrollArea, Stroke};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,6 +14,11 @@ const COMMON_BAUD_RATES: &[u32] = &[
 
 const MAX_ENTRIES: usize = 5000;
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+const DEFAULT_LOG_FONT_SIZE: f32 = 14.0;
+const MIN_LOG_FONT_SIZE: f32 = 8.0;
+const MAX_LOG_FONT_SIZE: f32 = 32.0;
+const LOG_FONT_STEP: f32 = 1.0;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum SendMode {
@@ -71,7 +76,9 @@ struct LogEntry {
     message: Option<String>,
 }
 
-pub struct GuiApp {
+pub struct SerialSession {
+    id: u64,
+
     available_ports: Vec<String>,
     last_port_refresh: Instant,
 
@@ -97,7 +104,6 @@ pub struct GuiApp {
     auto_scroll: bool,
     show_tx_in_log: bool,
     require_ctrl_enter_to_send: bool,
-    visuals_initialized: bool,
 
     bytes_rx: u64,
     bytes_tx: u64,
@@ -107,13 +113,308 @@ pub struct GuiApp {
     serial: SerialHandle,
 }
 
+pub struct Tab {
+    id: u64,
+    title: String,
+    panes: Vec<SerialSession>,
+    active_pane: usize,
+}
+
+pub struct GuiApp {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    next_session_id: u64,
+    next_tab_id: u64,
+    log_font_size: f32,
+    visuals_initialized: bool,
+    egui_ctx: egui::Context,
+}
+
 impl GuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let serial = spawn_serial_worker(cc.egui_ctx.clone());
+        let egui_ctx = cc.egui_ctx.clone();
+        let mut app = Self {
+            tabs: Vec::new(),
+            active_tab: 0,
+            next_session_id: 0,
+            next_tab_id: 0,
+            log_font_size: DEFAULT_LOG_FONT_SIZE,
+            visuals_initialized: false,
+            egui_ctx,
+        };
+        let first_tab = app.new_tab_with_one_session("Tab 1".to_string());
+        app.tabs.push(first_tab);
+        app
+    }
+
+    fn new_session(&mut self) -> SerialSession {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        SerialSession::new(id, self.egui_ctx.clone())
+    }
+
+    fn new_tab_with_one_session(&mut self, title: String) -> Tab {
+        let session = self.new_session();
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        Tab {
+            id: tab_id,
+            title,
+            panes: vec![session],
+            active_pane: 0,
+        }
+    }
+
+    fn add_tab(&mut self) {
+        let title = format!("Tab {}", self.tabs.len() + 1);
+        let tab = self.new_tab_with_one_session(title);
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        if self.tabs.len() <= 1 || idx >= self.tabs.len() {
+            return;
+        }
+        // shut down all sessions in the tab
+        for s in &self.tabs[idx].panes {
+            let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+        }
+        self.tabs.remove(idx);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+    }
+
+    fn split_active_pane(&mut self) {
+        let new_session = self.new_session();
+        let tab = &mut self.tabs[self.active_tab];
+        let insert_at = tab.active_pane + 1;
+        tab.panes.insert(insert_at, new_session);
+        tab.active_pane = insert_at;
+    }
+
+    fn close_pane(&mut self, tab_idx: usize, pane_idx: usize) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        let tab = &mut self.tabs[tab_idx];
+        if tab.panes.len() <= 1 {
+            return;
+        }
+        let removed = tab.panes.remove(pane_idx);
+        let _ = removed.serial.cmd_tx.send(SerialCommand::Shutdown);
+        if tab.active_pane >= tab.panes.len() {
+            tab.active_pane = tab.panes.len() - 1;
+        }
+    }
+
+    fn active_session_mut(&mut self) -> Option<&mut SerialSession> {
+        let tab = self.tabs.get_mut(self.active_tab)?;
+        tab.panes.get_mut(tab.active_pane)
+    }
+
+    fn save_active_log_to_timestamped_file(&mut self) {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        session.save_log_to_timestamped_file();
+    }
+
+    fn bump_log_font(&mut self, delta: f32) {
+        self.log_font_size =
+            (self.log_font_size + delta).clamp(MIN_LOG_FONT_SIZE, MAX_LOG_FONT_SIZE);
+    }
+
+    fn reset_log_font(&mut self) {
+        self.log_font_size = DEFAULT_LOG_FONT_SIZE;
+    }
+
+    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S)))
+        {
+            self.save_active_log_to_timestamped_file();
+        }
+        if ctx.input_mut(|i| {
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus))
+                || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals))
+        }) {
+            self.bump_log_font(LOG_FONT_STEP);
+        }
+        if ctx.input_mut(|i| {
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus))
+        }) {
+            self.bump_log_font(-LOG_FONT_STEP);
+        }
+        if ctx.input_mut(|i| {
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0))
+        }) {
+            self.reset_log_font();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::T)))
+        {
+            self.add_tab();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::W)))
+        {
+            self.close_tab(self.active_tab);
+        }
+    }
+
+    fn render_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let mut close_idx: Option<usize> = None;
+            let multi_tab = self.tabs.len() > 1;
+            for i in 0..self.tabs.len() {
+                let is_active = i == self.active_tab;
+                let title = self.tabs[i].title.clone();
+                ui.scope(|ui| {
+                    if is_active {
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill =
+                            Color32::from_rgb(220, 230, 245);
+                    }
+                    if ui
+                        .selectable_label(is_active, format!("  {}  ", title))
+                        .clicked()
+                    {
+                        self.active_tab = i;
+                    }
+                    if multi_tab {
+                        if ui.small_button("✕").on_hover_text("Close tab").clicked() {
+                            close_idx = Some(i);
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+            }
+            if let Some(i) = close_idx {
+                self.close_tab(i);
+            }
+            ui.separator();
+            if ui
+                .button("+ New tab")
+                .on_hover_text("New tab (Ctrl+T)")
+                .clicked()
+            {
+                self.add_tab();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("Log font: {:.0} px", self.log_font_size))
+                        .small()
+                        .color(Color32::GRAY),
+                );
+                if ui
+                    .small_button("A↺")
+                    .on_hover_text("Reset log font (Ctrl+0)")
+                    .clicked()
+                {
+                    self.reset_log_font();
+                }
+                if ui
+                    .small_button("A−")
+                    .on_hover_text("Smaller log font (Ctrl+-)")
+                    .clicked()
+                {
+                    self.bump_log_font(-LOG_FONT_STEP);
+                }
+                if ui
+                    .small_button("A+")
+                    .on_hover_text("Larger log font (Ctrl+=)")
+                    .clicked()
+                {
+                    self.bump_log_font(LOG_FONT_STEP);
+                }
+            });
+        });
+    }
+
+    fn render_active_tab(&mut self, ui: &mut egui::Ui) {
+        let log_font_size = self.log_font_size;
+        let active_tab = self.active_tab;
+        let mut split_request = false;
+        let mut close_pane_idx: Option<usize> = None;
+
+        let tab = &mut self.tabs[active_tab];
+        if tab.panes.is_empty() {
+            return;
+        }
+        let n = tab.panes.len();
+
+        // Render N-1 left side panels (resizable) and the last pane in central area.
+        for i in 0..n.saturating_sub(1) {
+            let pane_id = tab.panes[i].id;
+            let panel_id = format!("pane_panel_{}_{}", tab.id, pane_id);
+            let default_w = ui.available_width() / (n - i) as f32;
+            egui::SidePanel::left(panel_id)
+                .resizable(true)
+                .default_width(default_w)
+                .min_width(220.0)
+                .show_inside(ui, |ui| {
+                    let action = tab.panes[i].ui(ui, log_font_size, n > 1, i == tab.active_pane);
+                    apply_pane_action(action, &mut split_request, &mut close_pane_idx, i);
+                    if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
+                        tab.active_pane = i;
+                    }
+                });
+        }
+
+        let last_idx = n - 1;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
+            .show_inside(ui, |ui| {
+                let action =
+                    tab.panes[last_idx].ui(ui, log_font_size, n > 1, last_idx == tab.active_pane);
+                apply_pane_action(action, &mut split_request, &mut close_pane_idx, last_idx);
+                if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
+                    tab.active_pane = last_idx;
+                }
+            });
+
+        if split_request {
+            self.split_active_pane();
+        }
+        if let Some(idx) = close_pane_idx {
+            self.close_pane(active_tab, idx);
+        }
+    }
+
+    fn any_pane_busy(&self) -> bool {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.panes.iter())
+            .any(|p| p.connected || p.connecting)
+    }
+}
+
+#[derive(Default)]
+struct PaneAction {
+    split: bool,
+    close: bool,
+}
+
+fn apply_pane_action(
+    action: PaneAction,
+    split_request: &mut bool,
+    close_pane_idx: &mut Option<usize>,
+    idx: usize,
+) {
+    if action.split {
+        *split_request = true;
+    }
+    if action.close {
+        *close_pane_idx = Some(idx);
+    }
+}
+
+impl SerialSession {
+    fn new(id: u64, egui_ctx: egui::Context) -> Self {
+        let serial = spawn_serial_worker(egui_ctx);
         let available_ports = list_ports();
         let selected_port = available_ports.first().cloned().unwrap_or_default();
-
         Self {
+            id,
             available_ports,
             last_port_refresh: Instant::now(),
             selected_port,
@@ -135,7 +436,6 @@ impl GuiApp {
             auto_scroll: true,
             show_tx_in_log: true,
             require_ctrl_enter_to_send: false,
-            visuals_initialized: false,
             bytes_rx: 0,
             bytes_tx: 0,
             status: "Idle".to_string(),
@@ -260,7 +560,102 @@ impl GuiApp {
         }
     }
 
-    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+    fn save_log_to_timestamped_file(&mut self) {
+        let filename = format!("{}.txt", Local::now().format("%Y%m%d_%H%M%S"));
+        let path = PathBuf::from(&filename);
+        let mut content = String::new();
+        for entry in &self.entries {
+            let ts = format!("[{}] ", entry.timestamp.format("%Y-%m-%d %H:%M:%S%.3f"));
+            let prefix = match entry.kind {
+                EntryKind::Rx => "RX ",
+                EntryKind::Tx => "TX ",
+                EntryKind::System => "-- ",
+                EntryKind::SystemError => "!! ",
+            };
+            let body = match entry.kind {
+                EntryKind::System | EntryKind::SystemError => {
+                    entry.message.clone().unwrap_or_default()
+                }
+                EntryKind::Rx | EntryKind::Tx => format_bytes(&entry.bytes, self.display_mode),
+            };
+            content.push_str(&ts);
+            content.push_str(prefix);
+            content.push_str(&body);
+            content.push('\n');
+        }
+        match std::fs::write(&path, content) {
+            Ok(()) => {
+                let abs = std::fs::canonicalize(&path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| filename.clone());
+                self.push_system(format!("Saved log to {}", abs));
+            }
+            Err(e) => {
+                self.push_system_error(format!("Failed to save log to {}: {}", filename, e));
+            }
+        }
+    }
+
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        log_font_size: f32,
+        multi_pane: bool,
+        is_active: bool,
+    ) -> PaneAction {
+        // Per-frame housekeeping
+        if self.last_port_refresh.elapsed() >= PORT_REFRESH_INTERVAL && !self.connected {
+            self.refresh_ports();
+            self.last_port_refresh = Instant::now();
+        }
+        self.drain_serial_events();
+
+        if is_active {
+            // Faint highlight on the active pane border
+            let rect = ui.max_rect();
+            ui.painter().rect_stroke(
+                rect.shrink(1.0),
+                2.0,
+                Stroke::new(1.5, Color32::from_rgb(80, 130, 220)),
+            );
+        }
+
+        let mut action = PaneAction::default();
+
+        // Use a unique id-scope so widgets in multiple sessions don't collide.
+        let session_id = self.id;
+        ui.push_id(session_id, |ui| {
+            egui::TopBottomPanel::top(format!("settings_{}", session_id))
+                .resizable(false)
+                .show_inside(ui, |ui| {
+                    self.settings_panel(ui, multi_pane, &mut action);
+                });
+            egui::TopBottomPanel::bottom(format!("status_{}", session_id))
+                .resizable(false)
+                .show_inside(ui, |ui| {
+                    self.status_bar(ui);
+                });
+            egui::TopBottomPanel::bottom(format!("send_{}", session_id))
+                .resizable(true)
+                .min_height(80.0)
+                .show_inside(ui, |ui| {
+                    ui.add_space(2.0);
+                    self.send_panel(ui);
+                    ui.add_space(2.0);
+                });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::central_panel(ui.style()).inner_margin(2.0))
+                .show_inside(ui, |ui| {
+                    self.log_toolbar(ui);
+                    ui.separator();
+                    self.log_view(ui, log_font_size);
+                });
+        });
+
+        action
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui, multi_pane: bool, action: &mut PaneAction) {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.label("Port:");
@@ -296,7 +691,10 @@ impl GuiApp {
                 .show_ui(ui, |ui| {
                     for &b in COMMON_BAUD_RATES {
                         if ui
-                            .selectable_label(!self.use_custom_baud && self.baud_rate == b, b.to_string())
+                            .selectable_label(
+                                !self.use_custom_baud && self.baud_rate == b,
+                                b.to_string(),
+                            )
                             .clicked()
                         {
                             self.baud_rate = b;
@@ -336,7 +734,10 @@ impl GuiApp {
                 "Connect"
             };
             let can_act = !self.selected_port.is_empty() && self.baud_rate > 0;
-            let btn = ui.add_enabled(can_act && !self.connecting, egui::Button::new(connect_label));
+            let btn = ui.add_enabled(
+                can_act && !self.connecting,
+                egui::Button::new(connect_label),
+            );
             if btn.clicked() {
                 if self.connected {
                     let _ = self.serial.cmd_tx.send(SerialCommand::Disconnect);
@@ -350,13 +751,32 @@ impl GuiApp {
 
             ui.separator();
             let (dot, color) = if self.connected {
-                ("●", Color32::from_rgb(80, 200, 80))
+                ("●", Color32::from_rgb(40, 160, 60))
             } else if self.connecting {
-                ("●", Color32::from_rgb(220, 180, 60))
+                ("●", Color32::from_rgb(200, 150, 30))
             } else {
-                ("●", Color32::from_rgb(200, 80, 80))
+                ("●", Color32::from_rgb(190, 60, 60))
             };
             ui.label(RichText::new(dot).color(color));
+
+            // Pane controls on the right
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if multi_pane
+                    && ui
+                        .small_button("✕ Close pane")
+                        .on_hover_text("Close this pane")
+                        .clicked()
+                {
+                    action.close = true;
+                }
+                if ui
+                    .small_button("⮆ Split")
+                    .on_hover_text("Open another serial pane next to this one")
+                    .clicked()
+                {
+                    action.split = true;
+                }
+            });
         });
 
         ui.add_space(4.0);
@@ -365,7 +785,12 @@ impl GuiApp {
             egui::ComboBox::from_id_salt("databits_combo")
                 .selected_text(data_bits_label(self.data_bits))
                 .show_ui(ui, |ui| {
-                    for v in [DataBits::Five, DataBits::Six, DataBits::Seven, DataBits::Eight] {
+                    for v in [
+                        DataBits::Five,
+                        DataBits::Six,
+                        DataBits::Seven,
+                        DataBits::Eight,
+                    ] {
                         ui.selectable_value(&mut self.data_bits, v, data_bits_label(v));
                     }
                 });
@@ -428,7 +853,11 @@ impl GuiApp {
             ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
             ui.checkbox(&mut self.show_tx_in_log, "Echo TX");
             ui.separator();
-            if ui.button("Save…").on_hover_text("Save log to current directory (Ctrl+S)").clicked() {
+            if ui
+                .button("Save…")
+                .on_hover_text("Save log to current directory (Ctrl+S)")
+                .clicked()
+            {
                 self.save_log_to_timestamped_file();
             }
             if ui.button("Clear").clicked() {
@@ -439,56 +868,20 @@ impl GuiApp {
         });
     }
 
-    fn save_log_to_timestamped_file(&mut self) {
-        let filename = format!("{}.txt", Local::now().format("%Y%m%d_%H%M%S"));
-        let path = PathBuf::from(&filename);
-        let mut content = String::new();
-        for entry in &self.entries {
-            let ts = format!("[{}] ", entry.timestamp.format("%Y-%m-%d %H:%M:%S%.3f"));
-            let prefix = match entry.kind {
-                EntryKind::Rx => "RX ",
-                EntryKind::Tx => "TX ",
-                EntryKind::System => "-- ",
-                EntryKind::SystemError => "!! ",
-            };
-            let body = match entry.kind {
-                EntryKind::System | EntryKind::SystemError => {
-                    entry.message.clone().unwrap_or_default()
-                }
-                EntryKind::Rx | EntryKind::Tx => format_bytes(&entry.bytes, self.display_mode),
-            };
-            content.push_str(&ts);
-            content.push_str(prefix);
-            content.push_str(&body);
-            content.push('\n');
-        }
-        match std::fs::write(&path, content) {
-            Ok(()) => {
-                let abs = std::fs::canonicalize(&path)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| filename.clone());
-                self.push_system(format!("Saved log to {}", abs));
-            }
-            Err(e) => {
-                self.push_system_error(format!("Failed to save log to {}: {}", filename, e));
-            }
-        }
-    }
-
-    fn log_view(&self, ui: &mut egui::Ui) {
-        let row_height = ui.text_style_height(&TextStyle::Monospace);
+    fn log_view(&self, ui: &mut egui::Ui, log_font_size: f32) {
+        let row_height = log_font_size + 4.0;
         let mut area = ScrollArea::vertical().auto_shrink([false, false]);
         if self.auto_scroll {
             area = area.stick_to_bottom(true);
         }
         area.show_rows(ui, row_height, self.entries.len(), |ui, range| {
             for entry in &self.entries[range] {
-                self.render_entry(ui, entry);
+                self.render_entry(ui, entry, log_font_size);
             }
         });
     }
 
-    fn render_entry(&self, ui: &mut egui::Ui, entry: &LogEntry) {
+    fn render_entry(&self, ui: &mut egui::Ui, entry: &LogEntry, log_font_size: f32) {
         let ts = if self.show_timestamps {
             format!("[{}] ", entry.timestamp.format("%H:%M:%S%.3f"))
         } else {
@@ -503,14 +896,16 @@ impl GuiApp {
         };
 
         let body = match entry.kind {
-            EntryKind::System | EntryKind::SystemError => {
-                entry.message.clone().unwrap_or_default()
-            }
+            EntryKind::System | EntryKind::SystemError => entry.message.clone().unwrap_or_default(),
             EntryKind::Rx | EntryKind::Tx => format_bytes(&entry.bytes, self.display_mode),
         };
 
         let line = format!("{}{}{}", ts, prefix, body);
-        ui.label(RichText::new(line).monospace().color(color));
+        ui.label(
+            RichText::new(line)
+                .color(color)
+                .font(FontId::monospace(log_font_size)),
+        );
     }
 
     fn send_panel(&mut self, ui: &mut egui::Ui) {
@@ -549,14 +944,14 @@ impl GuiApp {
                 SendMode::Ascii => "Type text to send...",
                 SendMode::Hex => "Hex bytes, e.g. A0 B1 0F or A0B10F",
             };
-            let edit_id = egui::Id::new("send_input_edit");
+            let edit_id = egui::Id::new(("send_input_edit", self.id));
             let edit_focused = ui.ctx().memory(|m| m.has_focus(edit_id));
 
             let plain_enter_pressed = edit_focused
                 && !self.require_ctrl_enter_to_send
                 && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-            let ctrl_enter_pressed = edit_focused
-                && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+            let ctrl_enter_pressed =
+                edit_focused && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
 
             ui.add(
                 egui::TextEdit::multiline(&mut self.send_input)
@@ -564,7 +959,7 @@ impl GuiApp {
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .hint_text(hint)
-                    .font(TextStyle::Monospace),
+                    .font(egui::TextStyle::Monospace),
             );
 
             if plain_enter_pressed || ctrl_enter_pressed {
@@ -594,7 +989,11 @@ impl GuiApp {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        ui.label(RichText::new(e).small().color(Color32::from_rgb(255, 120, 120)));
+                        ui.label(
+                            RichText::new(e)
+                                .small()
+                                .color(Color32::from_rgb(190, 30, 30)),
+                        );
                     }
                 }
             }
@@ -621,47 +1020,25 @@ impl eframe::App for GuiApp {
             self.visuals_initialized = true;
         }
 
-        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
-            self.save_log_to_timestamped_file();
-        }
+        self.handle_global_shortcuts(ctx);
 
-        if self.last_port_refresh.elapsed() >= PORT_REFRESH_INTERVAL && !self.connected {
-            self.refresh_ports();
-            self.last_port_refresh = Instant::now();
-        }
-
-        self.drain_serial_events();
-
-        egui::TopBottomPanel::top("settings_panel")
+        egui::TopBottomPanel::top("tab_bar")
             .resizable(false)
-            .show(ctx, |ui| self.settings_panel(ui));
+            .show(ctx, |ui| self.render_tab_bar(ui));
 
-        egui::TopBottomPanel::bottom("status_bar")
-            .resizable(false)
-            .show(ctx, |ui| self.status_bar(ui));
+        egui::CentralPanel::default().show(ctx, |ui| self.render_active_tab(ui));
 
-        egui::TopBottomPanel::bottom("send_panel")
-            .resizable(true)
-            .min_height(80.0)
-            .show(ctx, |ui| {
-                ui.add_space(2.0);
-                self.send_panel(ui);
-                ui.add_space(2.0);
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.log_toolbar(ui);
-            ui.separator();
-            self.log_view(ui);
-        });
-
-        if self.connecting || self.connected {
+        if self.any_pane_busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.serial.cmd_tx.send(SerialCommand::Shutdown);
+        for tab in &self.tabs {
+            for s in &tab.panes {
+                let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+            }
+        }
     }
 }
 
@@ -723,9 +1100,9 @@ fn parse_hex_input(s: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(cleaned.len() / 2);
     let bytes = cleaned.as_bytes();
     for chunk in bytes.chunks(2) {
-        let pair = std::str::from_utf8(chunk).map_err(|_| "Invalid characters in hex".to_string())?;
-        let b = u8::from_str_radix(pair, 16)
-            .map_err(|_| format!("Invalid hex byte: {}", pair))?;
+        let pair =
+            std::str::from_utf8(chunk).map_err(|_| "Invalid characters in hex".to_string())?;
+        let b = u8::from_str_radix(pair, 16).map_err(|_| format!("Invalid hex byte: {}", pair))?;
         out.push(b);
     }
     Ok(out)
