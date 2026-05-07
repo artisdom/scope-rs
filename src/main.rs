@@ -1,4 +1,13 @@
 #![deny(warnings)]
+// In release builds on Windows, mark the binary as a GUI ("windows") subsystem
+// app so launching it does not flash up a console window. CLI/TUI subcommands
+// reattach the parent terminal's console at startup (see attach_parent_console
+// below), so running `scope list` / `scope serial` from cmd/PowerShell still
+// works as before.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 extern crate core;
 
@@ -9,6 +18,25 @@ mod inputs;
 mod interfaces;
 mod list;
 mod plugin;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn AttachConsole(dw_process_id: u32) -> i32;
+}
+
+/// On Windows, attach to the console of the parent process (the cmd/PowerShell
+/// that launched us, if any) so stdout/stderr from CLI/TUI subcommands lands
+/// somewhere visible. No-op when there's no parent console (e.g. launched from
+/// Explorer) or on non-Windows platforms.
+fn attach_parent_console() {
+    #[cfg(target_os = "windows")]
+    {
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
 
 use crate::infra::tags::TagList;
 use crate::interfaces::rtt_if::{RttCommand, RttConnections, RttSetup};
@@ -320,7 +348,14 @@ fn main() -> Result<(), String> {
     let tag_file = cli.tag_file.unwrap_or(PathBuf::from(DEFAULT_TAG_FILE));
     let latency = cli.latency.unwrap_or(100).clamp(0, 100_000);
 
-    let result = match cli.command.unwrap_or(Commands::Gui) {
+    let command = cli.command.unwrap_or(Commands::Gui);
+    // Reattach the parent terminal's console for every command — including the
+    // GUI — so error output (e.g. failed-to-load state, panic messages) lands
+    // in the shell that launched us. The trade-off is that shells will block
+    // on the GUI process until it exits.
+    attach_parent_console();
+
+    let result = match command {
         Commands::Serial { port, baudrate } => {
             app_serial(capacity, tag_file, port, baudrate, latency)
         }
