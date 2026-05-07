@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local};
 use egui::{Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, ScrollArea, Stroke};
+use serde::{Deserialize, Serialize};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -13,20 +14,22 @@ const COMMON_BAUD_RATES: &[u32] = &[
 ];
 
 const MAX_ENTRIES: usize = 5000;
+const MAX_HISTORY: usize = 1000;
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const STATE_AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 const DEFAULT_LOG_FONT_SIZE: f32 = 14.0;
 const MIN_LOG_FONT_SIZE: f32 = 8.0;
 const MAX_LOG_FONT_SIZE: f32 = 32.0;
 const LOG_FONT_STEP: f32 = 1.0;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum SendMode {
     Ascii,
     Hex,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum LineEnding {
     None,
     Cr,
@@ -54,7 +57,7 @@ impl LineEnding {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum DisplayMode {
     Ascii,
     Hex,
@@ -97,6 +100,13 @@ pub struct SerialSession {
     send_input: String,
     send_mode: SendMode,
     line_ending: LineEnding,
+    /// Index into the global send history when navigating with Up/Down,
+    /// counted from the most recent entry (0 = most recent). `None` when
+    /// the user is editing their own draft rather than viewing history.
+    history_cursor: Option<usize>,
+    /// The user's in-progress draft, saved when they start navigating
+    /// history so Down past the most-recent entry can restore it.
+    history_draft: String,
 
     entries: Vec<LogEntry>,
     display_mode: DisplayMode,
@@ -114,7 +124,7 @@ pub struct SerialSession {
 }
 
 /// Direction in which a `Container`'s children are arranged.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Direction {
     /// Children laid out side-by-side (split-right).
     Horizontal,
@@ -151,6 +161,11 @@ pub struct GuiApp {
     log_font_size: f32,
     visuals_initialized: bool,
     egui_ctx: egui::Context,
+    /// Global send history shared across all panes/tabs. Newest entries at the back.
+    send_history: Vec<String>,
+    /// Set when in-memory state diverges from the persisted file.
+    state_dirty: bool,
+    last_save_attempt: Instant,
 }
 
 impl GuiApp {
@@ -164,9 +179,26 @@ impl GuiApp {
             log_font_size: DEFAULT_LOG_FONT_SIZE,
             visuals_initialized: false,
             egui_ctx,
+            send_history: Vec::new(),
+            state_dirty: false,
+            last_save_attempt: Instant::now(),
         };
-        let first_tab = app.new_tab_with_one_session("Tab 1".to_string());
-        app.tabs.push(first_tab);
+
+        let had_state = if let Some(state) = load_persisted_state() {
+            app.apply_persisted_state(state);
+            true
+        } else {
+            false
+        };
+        if app.tabs.is_empty() {
+            let first_tab = app.new_tab_with_one_session("Tab 1".to_string());
+            app.tabs.push(first_tab);
+        }
+        if !had_state {
+            // Write defaults so the user has a file to inspect / edit and so
+            // we don't have to wait for graceful exit on first launch.
+            app.save_state_now();
+        }
         app
     }
 
@@ -174,6 +206,98 @@ impl GuiApp {
         let id = self.next_session_id;
         self.next_session_id += 1;
         SerialSession::new(id, self.egui_ctx.clone())
+    }
+
+    fn new_session_from(&mut self, ps: &PersistedSession) -> SerialSession {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        SerialSession::from_persisted(id, self.egui_ctx.clone(), ps)
+    }
+
+    fn apply_persisted_state(&mut self, state: PersistedState) {
+        self.log_font_size = state
+            .log_font_size
+            .clamp(MIN_LOG_FONT_SIZE, MAX_LOG_FONT_SIZE);
+        self.send_history = state.send_history;
+        if self.send_history.len() > MAX_HISTORY {
+            let excess = self.send_history.len() - MAX_HISTORY;
+            self.send_history.drain(..excess);
+        }
+        self.tabs = state
+            .tabs
+            .into_iter()
+            .map(|pt| {
+                let tab_id = self.next_tab_id;
+                self.next_tab_id += 1;
+                Tab {
+                    id: tab_id,
+                    title: pt.title,
+                    root: self.layout_from_persisted(pt.root),
+                    active_path: pt.active_path,
+                }
+            })
+            .collect();
+        // Ensure each tab's active path is valid; otherwise reset to first leaf.
+        for tab in &mut self.tabs {
+            if leaf_at_path_mut(&mut tab.root, &tab.active_path).is_none() {
+                tab.active_path = first_leaf_path(&tab.root);
+            }
+        }
+        self.active_tab = state.active_tab.min(self.tabs.len().saturating_sub(1));
+    }
+
+    fn layout_from_persisted(&mut self, p: PersistedLayout) -> LayoutNode {
+        match p {
+            PersistedLayout::Leaf(s) => LayoutNode::Leaf(self.new_session_from(&s)),
+            PersistedLayout::Container { dir, children } => LayoutNode::Container {
+                dir,
+                children: children
+                    .into_iter()
+                    .map(|c| self.layout_from_persisted(c))
+                    .collect(),
+            },
+        }
+    }
+
+    fn build_persisted_state(&self) -> PersistedState {
+        PersistedState {
+            schema: PERSIST_SCHEMA,
+            log_font_size: self.log_font_size,
+            send_history: self.send_history.clone(),
+            active_tab: self.active_tab,
+            tabs: self
+                .tabs
+                .iter()
+                .map(|t| PersistedTab {
+                    title: t.title.clone(),
+                    active_path: t.active_path.clone(),
+                    root: persisted_layout_from(&t.root),
+                })
+                .collect(),
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.state_dirty = true;
+    }
+
+    fn save_state_if_due(&mut self) {
+        if !self.state_dirty {
+            return;
+        }
+        if self.last_save_attempt.elapsed() < STATE_AUTOSAVE_DEBOUNCE {
+            return;
+        }
+        self.save_state_now();
+    }
+
+    fn save_state_now(&mut self) {
+        let state = self.build_persisted_state();
+        if let Err(e) = save_persisted_state(&state) {
+            eprintln!("[scope] failed to save GUI state: {}", e);
+        }
+        self.state_dirty = false;
+        self.last_save_attempt = Instant::now();
     }
 
     fn new_tab_with_one_session(&mut self, title: String) -> Tab {
@@ -193,6 +317,7 @@ impl GuiApp {
         let tab = self.new_tab_with_one_session(title);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
+        self.mark_dirty();
     }
 
     fn close_tab(&mut self, idx: usize) {
@@ -207,6 +332,7 @@ impl GuiApp {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
+        self.mark_dirty();
     }
 
     fn split_active_pane(&mut self, dir: Direction) {
@@ -215,6 +341,7 @@ impl GuiApp {
         let path = tab.active_path.clone();
         let new_path = split_at_path(&mut tab.root, &path, new_session, dir);
         tab.active_path = new_path;
+        self.mark_dirty();
     }
 
     fn close_pane(&mut self, tab_idx: usize, path: &[usize]) {
@@ -230,6 +357,7 @@ impl GuiApp {
             collapse_single_children(&mut tab.root);
             // Active path may now be invalid — reset to the first leaf in the tree.
             tab.active_path = first_leaf_path(&tab.root);
+            self.mark_dirty();
         }
     }
 
@@ -247,12 +375,18 @@ impl GuiApp {
     }
 
     fn bump_log_font(&mut self, delta: f32) {
-        self.log_font_size =
-            (self.log_font_size + delta).clamp(MIN_LOG_FONT_SIZE, MAX_LOG_FONT_SIZE);
+        let new_size = (self.log_font_size + delta).clamp(MIN_LOG_FONT_SIZE, MAX_LOG_FONT_SIZE);
+        if (new_size - self.log_font_size).abs() > f32::EPSILON {
+            self.log_font_size = new_size;
+            self.mark_dirty();
+        }
     }
 
     fn reset_log_font(&mut self) {
-        self.log_font_size = DEFAULT_LOG_FONT_SIZE;
+        if (self.log_font_size - DEFAULT_LOG_FONT_SIZE).abs() > f32::EPSILON {
+            self.log_font_size = DEFAULT_LOG_FONT_SIZE;
+            self.mark_dirty();
+        }
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
@@ -304,6 +438,7 @@ impl GuiApp {
                         .clicked()
                     {
                         self.active_tab = i;
+                        self.state_dirty = true;
                     }
                     if multi_tab {
                         if ui.small_button("✕").on_hover_text("Close tab").clicked() {
@@ -358,6 +493,7 @@ impl GuiApp {
     fn render_active_tab(&mut self, ui: &mut egui::Ui) {
         let log_font_size = self.log_font_size;
         let active_tab = self.active_tab;
+        let history = &mut self.send_history;
         let tab = &mut self.tabs[active_tab];
         let tab_id = tab.id;
         let multi_pane = count_leaves(&tab.root) > 1;
@@ -372,11 +508,15 @@ impl GuiApp {
             &active_path,
             log_font_size,
             multi_pane,
+            history,
             &mut collected,
         );
 
         if let Some(path) = collected.activate {
             tab.active_path = path;
+        }
+        if collected.sent {
+            self.state_dirty = true;
         }
         if let Some((path, dir)) = collected.split {
             // Make sure the active pointer matches the pane we're splitting from,
@@ -407,6 +547,7 @@ struct PaneAction {
     split_right: bool,
     split_down: bool,
     close: bool,
+    sent: bool,
 }
 
 #[derive(Default)]
@@ -414,6 +555,7 @@ struct CollectedActions {
     activate: Option<Vec<usize>>,
     split: Option<(Vec<usize>, Direction)>,
     close: Option<Vec<usize>>,
+    sent: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,12 +567,13 @@ fn render_node(
     active_path: &[usize],
     log_font_size: f32,
     multi_pane: bool,
+    history: &mut Vec<String>,
     actions: &mut CollectedActions,
 ) {
     match node {
         LayoutNode::Leaf(session) => {
             let is_active = path.as_slice() == active_path;
-            let pane_action = session.ui(ui, log_font_size, multi_pane, is_active);
+            let pane_action = session.ui(ui, log_font_size, multi_pane, is_active, history);
             if pane_action.split_right {
                 actions.split = Some((path.clone(), Direction::Horizontal));
             } else if pane_action.split_down {
@@ -438,6 +581,9 @@ fn render_node(
             }
             if pane_action.close {
                 actions.close = Some(path.clone());
+            }
+            if pane_action.sent {
+                actions.sent = true;
             }
             if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
                 actions.activate = Some(path);
@@ -473,6 +619,7 @@ fn render_node(
                                     active_path,
                                     log_font_size,
                                     multi_pane,
+                                    history,
                                     actions,
                                 );
                             });
@@ -491,6 +638,7 @@ fn render_node(
                                     active_path,
                                     log_font_size,
                                     multi_pane,
+                                    history,
                                     actions,
                                 );
                             });
@@ -511,6 +659,7 @@ fn render_node(
                         active_path,
                         log_font_size,
                         multi_pane,
+                        history,
                         actions,
                     );
                 });
@@ -707,6 +856,8 @@ impl SerialSession {
             send_input: String::new(),
             send_mode: SendMode::Ascii,
             line_ending: LineEnding::CrLf,
+            history_cursor: None,
+            history_draft: String::new(),
             entries: Vec::new(),
             display_mode: DisplayMode::Ascii,
             show_timestamps: true,
@@ -717,6 +868,64 @@ impl SerialSession {
             bytes_tx: 0,
             status: "Idle".to_string(),
             serial,
+        }
+    }
+
+    fn from_persisted(id: u64, egui_ctx: egui::Context, p: &PersistedSession) -> Self {
+        let serial = spawn_serial_worker(egui_ctx);
+        let available_ports = list_ports();
+        // Keep the persisted port even if it isn't currently plugged in — the
+        // user may want to reconnect once the device shows up. Combo box will
+        // show it in the dropdown via `selected_text`.
+        Self {
+            id,
+            available_ports,
+            last_port_refresh: Instant::now(),
+            selected_port: p.port.clone(),
+            baud_rate: p.baud_rate,
+            custom_baud_str: p.custom_baud_str.clone(),
+            use_custom_baud: p.use_custom_baud,
+            data_bits: data_bits_from_u8(p.data_bits),
+            stop_bits: stop_bits_from_u8(p.stop_bits),
+            parity: p.parity.into(),
+            flow_control: p.flow.into(),
+            connected: false,
+            connecting: false,
+            send_input: String::new(),
+            send_mode: p.send_mode,
+            line_ending: p.line_ending,
+            history_cursor: None,
+            history_draft: String::new(),
+            entries: Vec::new(),
+            display_mode: p.display_mode,
+            show_timestamps: p.show_timestamps,
+            auto_scroll: p.auto_scroll,
+            show_tx_in_log: p.show_tx_in_log,
+            require_ctrl_enter_to_send: p.require_ctrl_enter_to_send,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            status: "Idle".to_string(),
+            serial,
+        }
+    }
+
+    fn to_persisted(&self) -> PersistedSession {
+        PersistedSession {
+            port: self.selected_port.clone(),
+            baud_rate: self.baud_rate,
+            custom_baud_str: self.custom_baud_str.clone(),
+            use_custom_baud: self.use_custom_baud,
+            data_bits: data_bits_to_u8(self.data_bits),
+            stop_bits: stop_bits_to_u8(self.stop_bits),
+            parity: self.parity.into(),
+            flow: self.flow_control.into(),
+            send_mode: self.send_mode,
+            line_ending: self.line_ending,
+            display_mode: self.display_mode,
+            show_timestamps: self.show_timestamps,
+            auto_scroll: self.auto_scroll,
+            show_tx_in_log: self.show_tx_in_log,
+            require_ctrl_enter_to_send: self.require_ctrl_enter_to_send,
         }
     }
 
@@ -809,19 +1018,27 @@ impl SerialSession {
         Ok(payload)
     }
 
-    fn try_send(&mut self) {
+    /// Returns true when something was actually sent (caller should mark
+    /// state dirty so history is persisted).
+    fn try_send(&mut self, history: &mut Vec<String>) -> bool {
         if !self.connected {
             self.push_system_error("Cannot send: not connected".to_string());
-            return;
+            return false;
         }
+        let typed = self.send_input.clone();
         match self.build_send_payload() {
-            Ok(payload) if payload.is_empty() => {}
+            Ok(payload) if payload.is_empty() => false,
             Ok(payload) => {
                 let _ = self.serial.cmd_tx.send(SerialCommand::Send(payload));
                 self.send_input.clear();
+                push_history(history, typed);
+                self.history_cursor = None;
+                self.history_draft.clear();
+                true
             }
             Err(e) => {
                 self.push_system_error(format!("Send error: {}", e));
+                false
             }
         }
     }
@@ -834,6 +1051,38 @@ impl SerialSession {
             stop_bits: self.stop_bits,
             parity: self.parity,
             flow_control: self.flow_control,
+        }
+    }
+
+    fn history_up(&mut self, history: &[String]) {
+        if history.is_empty() {
+            return;
+        }
+        let new_cursor = match self.history_cursor {
+            None => {
+                self.history_draft = self.send_input.clone();
+                0
+            }
+            Some(c) => (c + 1).min(history.len() - 1),
+        };
+        self.history_cursor = Some(new_cursor);
+        self.send_input = history[history.len() - 1 - new_cursor].clone();
+    }
+
+    fn history_down(&mut self, history: &[String]) {
+        match self.history_cursor {
+            None => {}
+            Some(0) => {
+                self.history_cursor = None;
+                self.send_input = std::mem::take(&mut self.history_draft);
+            }
+            Some(c) => {
+                let new_cursor = c - 1;
+                self.history_cursor = Some(new_cursor);
+                if !history.is_empty() {
+                    self.send_input = history[history.len() - 1 - new_cursor].clone();
+                }
+            }
         }
     }
 
@@ -879,6 +1128,7 @@ impl SerialSession {
         log_font_size: f32,
         multi_pane: bool,
         is_active: bool,
+        history: &mut Vec<String>,
     ) -> PaneAction {
         // Per-frame housekeeping
         if self.last_port_refresh.elapsed() >= PORT_REFRESH_INTERVAL && !self.connected {
@@ -917,7 +1167,7 @@ impl SerialSession {
                 .min_height(80.0)
                 .show_inside(ui, |ui| {
                     ui.add_space(2.0);
-                    self.send_panel(ui);
+                    self.send_panel(ui, history, &mut action);
                     ui.add_space(2.0);
                 });
             egui::CentralPanel::default()
@@ -1192,7 +1442,12 @@ impl SerialSession {
         );
     }
 
-    fn send_panel(&mut self, ui: &mut egui::Ui) {
+    fn send_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        history: &mut Vec<String>,
+        action: &mut PaneAction,
+    ) {
         ui.horizontal(|ui| {
             ui.label("Mode:");
             ui.selectable_value(&mut self.send_mode, SendMode::Ascii, "ASCII");
@@ -1219,14 +1474,21 @@ impl SerialSession {
             .on_hover_text(
                 "Off: plain Enter sends. On: Enter inserts a newline; Ctrl+Enter sends.",
             );
+            ui.separator();
+            ui.label(
+                RichText::new(format!("History: {}", history.len()))
+                    .small()
+                    .color(Color32::GRAY),
+            )
+            .on_hover_text("Up/Down arrow keys cycle through previously sent input");
         });
 
         ui.add_space(2.0);
 
         ui.horizontal(|ui| {
             let hint = match self.send_mode {
-                SendMode::Ascii => "Type text to send...",
-                SendMode::Hex => "Hex bytes, e.g. A0 B1 0F or A0B10F",
+                SendMode::Ascii => "Type text to send (↑/↓ for history)...",
+                SendMode::Hex => "Hex bytes, e.g. A0 B1 0F or A0B10F (↑/↓ for history)",
             };
             let edit_id = egui::Id::new(("send_input_edit", self.id));
             let edit_focused = ui.ctx().memory(|m| m.has_focus(edit_id));
@@ -1236,6 +1498,20 @@ impl SerialSession {
                 && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
             let ctrl_enter_pressed =
                 edit_focused && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+
+            // History navigation: only when the input has focus, consume Up/Down
+            // *before* the TextEdit sees them so the multiline caret-walk
+            // behavior doesn't conflict with history scrolling.
+            let up_pressed =
+                edit_focused && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
+            let down_pressed =
+                edit_focused && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown));
+            if up_pressed {
+                self.history_up(history);
+            }
+            if down_pressed {
+                self.history_down(history);
+            }
 
             ui.add(
                 egui::TextEdit::multiline(&mut self.send_input)
@@ -1247,7 +1523,9 @@ impl SerialSession {
             );
 
             if plain_enter_pressed || ctrl_enter_pressed {
-                self.try_send();
+                if self.try_send(history) {
+                    action.sent = true;
+                }
             }
         });
 
@@ -1256,8 +1534,8 @@ impl SerialSession {
                 self.connected && !self.send_input.is_empty(),
                 egui::Button::new("Send"),
             );
-            if send_btn.clicked() {
-                self.try_send();
+            if send_btn.clicked() && self.try_send(history) {
+                action.sent = true;
             }
             if ui.button("Clear input").clicked() {
                 self.send_input.clear();
@@ -1312,12 +1590,16 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| self.render_active_tab(ui));
 
+        self.save_state_if_due();
+
         if self.any_pane_busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Best-effort: flush pending state to disk before workers shut down.
+        self.save_state_now();
         for tab in &self.tabs {
             for_each_leaf(&tab.root, &mut |s| {
                 let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
@@ -1440,4 +1722,221 @@ fn format_hex_dump(bytes: &[u8]) -> String {
         });
     }
     format!("{}  |{}|", hex, ascii)
+}
+
+// ---------------------------------------------------------------------------
+// Send history
+// ---------------------------------------------------------------------------
+
+fn push_history(history: &mut Vec<String>, entry: String) {
+    if entry.is_empty() {
+        return;
+    }
+    if history.last().map(|e| e == &entry).unwrap_or(false) {
+        return; // skip duplicates of the most recent entry
+    }
+    history.push(entry);
+    if history.len() > MAX_HISTORY {
+        let excess = history.len() - MAX_HISTORY;
+        history.drain(..excess);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+const PERSIST_SCHEMA: u32 = 1;
+const PERSIST_FILENAME: &str = "gui_state.yml";
+const PERSIST_DIR: &str = "scope-rs";
+
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    /// Schema version, in case the format ever needs to change in a backwards-
+    /// incompatible way. Older Scope binaries that don't recognize the version
+    /// can fall back to defaults rather than misinterpret the file.
+    #[serde(default)]
+    schema: u32,
+    log_font_size: f32,
+    #[serde(default)]
+    send_history: Vec<String>,
+    #[serde(default)]
+    active_tab: usize,
+    tabs: Vec<PersistedTab>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedTab {
+    title: String,
+    #[serde(default)]
+    active_path: Vec<usize>,
+    root: PersistedLayout,
+}
+
+#[derive(Serialize, Deserialize)]
+enum PersistedLayout {
+    Leaf(PersistedSession),
+    Container {
+        dir: Direction,
+        children: Vec<PersistedLayout>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    port: String,
+    baud_rate: u32,
+    #[serde(default)]
+    use_custom_baud: bool,
+    #[serde(default)]
+    custom_baud_str: String,
+    /// 5..=8
+    data_bits: u8,
+    /// 1 or 2
+    stop_bits: u8,
+    parity: PrettyParity,
+    flow: PrettyFlow,
+    send_mode: SendMode,
+    line_ending: LineEnding,
+    display_mode: DisplayMode,
+    show_timestamps: bool,
+    auto_scroll: bool,
+    show_tx_in_log: bool,
+    require_ctrl_enter_to_send: bool,
+}
+
+#[derive(Copy, Clone, Serialize, Deserialize)]
+enum PrettyParity {
+    None,
+    Odd,
+    Even,
+}
+
+impl From<Parity> for PrettyParity {
+    fn from(p: Parity) -> Self {
+        match p {
+            Parity::None => PrettyParity::None,
+            Parity::Odd => PrettyParity::Odd,
+            Parity::Even => PrettyParity::Even,
+        }
+    }
+}
+
+impl From<PrettyParity> for Parity {
+    fn from(p: PrettyParity) -> Self {
+        match p {
+            PrettyParity::None => Parity::None,
+            PrettyParity::Odd => Parity::Odd,
+            PrettyParity::Even => Parity::Even,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Serialize, Deserialize)]
+enum PrettyFlow {
+    None,
+    Software,
+    Hardware,
+}
+
+impl From<FlowControl> for PrettyFlow {
+    fn from(f: FlowControl) -> Self {
+        match f {
+            FlowControl::None => PrettyFlow::None,
+            FlowControl::Software => PrettyFlow::Software,
+            FlowControl::Hardware => PrettyFlow::Hardware,
+        }
+    }
+}
+
+impl From<PrettyFlow> for FlowControl {
+    fn from(f: PrettyFlow) -> Self {
+        match f {
+            PrettyFlow::None => FlowControl::None,
+            PrettyFlow::Software => FlowControl::Software,
+            PrettyFlow::Hardware => FlowControl::Hardware,
+        }
+    }
+}
+
+fn data_bits_to_u8(d: DataBits) -> u8 {
+    match d {
+        DataBits::Five => 5,
+        DataBits::Six => 6,
+        DataBits::Seven => 7,
+        DataBits::Eight => 8,
+    }
+}
+
+fn data_bits_from_u8(v: u8) -> DataBits {
+    match v {
+        5 => DataBits::Five,
+        6 => DataBits::Six,
+        7 => DataBits::Seven,
+        _ => DataBits::Eight,
+    }
+}
+
+fn stop_bits_to_u8(s: StopBits) -> u8 {
+    match s {
+        StopBits::One => 1,
+        StopBits::Two => 2,
+    }
+}
+
+fn stop_bits_from_u8(v: u8) -> StopBits {
+    match v {
+        2 => StopBits::Two,
+        _ => StopBits::One,
+    }
+}
+
+fn persisted_layout_from(node: &LayoutNode) -> PersistedLayout {
+    match node {
+        LayoutNode::Leaf(s) => PersistedLayout::Leaf(s.to_persisted()),
+        LayoutNode::Container { dir, children } => PersistedLayout::Container {
+            dir: *dir,
+            children: children.iter().map(persisted_layout_from).collect(),
+        },
+    }
+}
+
+fn state_path() -> Option<PathBuf> {
+    let mut p = dirs::config_dir()?;
+    p.push(PERSIST_DIR);
+    p.push(PERSIST_FILENAME);
+    Some(p)
+}
+
+fn load_persisted_state() -> Option<PersistedState> {
+    let path = state_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_yaml::from_slice::<PersistedState>(&bytes) {
+        Ok(s) if s.schema == 0 || s.schema == PERSIST_SCHEMA => Some(s),
+        Ok(_) => {
+            eprintln!(
+                "[scope] ignoring GUI state at {} — unknown schema version",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "[scope] failed to parse GUI state at {}: {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+fn save_persisted_state(state: &PersistedState) -> Result<(), String> {
+    let path = state_path().ok_or_else(|| "no config directory available".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+    }
+    let yaml = serde_yaml::to_string(state).map_err(|e| e.to_string())?;
+    std::fs::write(&path, yaml).map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
