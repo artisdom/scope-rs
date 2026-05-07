@@ -113,14 +113,34 @@ pub struct SerialSession {
     serial: SerialHandle,
 }
 
+/// Direction in which a `Container`'s children are arranged.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Direction {
+    /// Children laid out side-by-side (split-right).
+    Horizontal,
+    /// Children stacked top-to-bottom (split-down).
+    Vertical,
+}
+
+/// Tree of split panes. A `Leaf` is a single serial session; a `Container`
+/// arranges N children in one direction. Splitting a leaf inside a container
+/// of the same direction appends a sibling, so the tree stays flat when it
+/// can — only direction changes introduce nesting.
+pub enum LayoutNode {
+    Leaf(SerialSession),
+    Container {
+        dir: Direction,
+        children: Vec<LayoutNode>,
+    },
+}
+
 pub struct Tab {
     id: u64,
     title: String,
-    /// Rows of panes. Rows stack vertically (top-to-bottom).
-    /// Within each row, panes lay out side-by-side (left-to-right).
-    rows: Vec<Vec<SerialSession>>,
-    active_row: usize,
-    active_col: usize,
+    root: LayoutNode,
+    /// Path through `Container.children` indices to the active leaf.
+    /// Empty path means the root itself is the active leaf.
+    active_path: Vec<usize>,
 }
 
 pub struct GuiApp {
@@ -163,9 +183,8 @@ impl GuiApp {
         Tab {
             id: tab_id,
             title,
-            rows: vec![vec![session]],
-            active_row: 0,
-            active_col: 0,
+            root: LayoutNode::Leaf(session),
+            active_path: Vec::new(),
         }
     }
 
@@ -181,71 +200,43 @@ impl GuiApp {
             return;
         }
         // shut down all sessions in the tab
-        for row in &self.tabs[idx].rows {
-            for s in row {
-                let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
-            }
-        }
+        for_each_leaf(&self.tabs[idx].root, &mut |s| {
+            let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+        });
         self.tabs.remove(idx);
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
     }
 
-    /// Add a new pane immediately to the right of the active pane (within the same row).
-    fn split_active_pane_right(&mut self) {
+    fn split_active_pane(&mut self, dir: Direction) {
         let new_session = self.new_session();
         let tab = &mut self.tabs[self.active_tab];
-        let row = &mut tab.rows[tab.active_row];
-        let insert_at = tab.active_col + 1;
-        row.insert(insert_at, new_session);
-        tab.active_col = insert_at;
+        let path = tab.active_path.clone();
+        let new_path = split_at_path(&mut tab.root, &path, new_session, dir);
+        tab.active_path = new_path;
     }
 
-    /// Add a new row containing one pane, immediately below the active row.
-    fn split_active_pane_down(&mut self) {
-        let new_session = self.new_session();
-        let tab = &mut self.tabs[self.active_tab];
-        let insert_at = tab.active_row + 1;
-        tab.rows.insert(insert_at, vec![new_session]);
-        tab.active_row = insert_at;
-        tab.active_col = 0;
-    }
-
-    fn close_pane(&mut self, tab_idx: usize, row_idx: usize, col_idx: usize) {
+    fn close_pane(&mut self, tab_idx: usize, path: &[usize]) {
         if tab_idx >= self.tabs.len() {
             return;
         }
         let tab = &mut self.tabs[tab_idx];
-        // Refuse to close the last pane in the tab
-        let total: usize = tab.rows.iter().map(|r| r.len()).sum();
-        if total <= 1 {
+        if count_leaves(&tab.root) <= 1 {
             return;
         }
-        if row_idx >= tab.rows.len() || col_idx >= tab.rows[row_idx].len() {
-            return;
-        }
-        let removed = tab.rows[row_idx].remove(col_idx);
-        let _ = removed.serial.cmd_tx.send(SerialCommand::Shutdown);
-        // If the row is now empty, drop it
-        if tab.rows[row_idx].is_empty() {
-            tab.rows.remove(row_idx);
-            if tab.active_row >= tab.rows.len() {
-                tab.active_row = tab.rows.len() - 1;
-            }
-        } else if tab.active_row == row_idx && tab.active_col >= tab.rows[row_idx].len() {
-            tab.active_col = tab.rows[row_idx].len() - 1;
-        }
-        // Clamp active_col against whatever row we now point at
-        if tab.active_col >= tab.rows[tab.active_row].len() {
-            tab.active_col = tab.rows[tab.active_row].len() - 1;
+        if let Some(removed) = remove_leaf_at_path(&mut tab.root, path) {
+            let _ = removed.serial.cmd_tx.send(SerialCommand::Shutdown);
+            collapse_single_children(&mut tab.root);
+            // Active path may now be invalid — reset to the first leaf in the tree.
+            tab.active_path = first_leaf_path(&tab.root);
         }
     }
 
     fn active_session_mut(&mut self) -> Option<&mut SerialSession> {
         let tab = self.tabs.get_mut(self.active_tab)?;
-        let row = tab.rows.get_mut(tab.active_row)?;
-        row.get_mut(tab.active_col)
+        let path = tab.active_path.clone();
+        leaf_at_path_mut(&mut tab.root, &path)
     }
 
     fn save_active_log_to_timestamped_file(&mut self) {
@@ -367,148 +358,47 @@ impl GuiApp {
     fn render_active_tab(&mut self, ui: &mut egui::Ui) {
         let log_font_size = self.log_font_size;
         let active_tab = self.active_tab;
-        let mut split_right = false;
-        let mut split_down = false;
-        let mut close_at: Option<(usize, usize)> = None;
-
         let tab = &mut self.tabs[active_tab];
-        if tab.rows.is_empty() {
-            return;
-        }
-        let n_rows = tab.rows.len();
-        let total_panes: usize = tab.rows.iter().map(|r| r.len()).sum();
-        let multi_pane = total_panes > 1;
         let tab_id = tab.id;
+        let multi_pane = count_leaves(&tab.root) > 1;
+        let active_path = tab.active_path.clone();
 
-        // Render top n_rows-1 rows as TopBottomPanel::top (resizable horizontal split),
-        // and the final row as a CentralPanel that fills remaining height.
-        for r in 0..n_rows.saturating_sub(1) {
-            let row_panel_id = format!("row_top_{}_{}", tab_id, r);
-            let default_h = ui.available_height() / (n_rows - r) as f32;
-            egui::TopBottomPanel::top(row_panel_id)
-                .resizable(true)
-                .default_height(default_h)
-                .min_height(140.0)
-                .show_inside(ui, |ui| {
-                    Self::render_row(
-                        ui,
-                        tab_id,
-                        r,
-                        &mut tab.rows[r],
-                        tab.active_row,
-                        &mut tab.active_col,
-                        &mut tab.active_row,
-                        log_font_size,
-                        multi_pane,
-                        &mut split_right,
-                        &mut split_down,
-                        &mut close_at,
-                    );
-                });
-        }
+        let mut collected = CollectedActions::default();
+        render_node(
+            &mut tab.root,
+            ui,
+            Vec::new(),
+            tab_id,
+            &active_path,
+            log_font_size,
+            multi_pane,
+            &mut collected,
+        );
 
-        let last_row = n_rows - 1;
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
-            .show_inside(ui, |ui| {
-                Self::render_row(
-                    ui,
-                    tab_id,
-                    last_row,
-                    &mut tab.rows[last_row],
-                    tab.active_row,
-                    &mut tab.active_col,
-                    &mut tab.active_row,
-                    log_font_size,
-                    multi_pane,
-                    &mut split_right,
-                    &mut split_down,
-                    &mut close_at,
-                );
-            });
-
-        if split_right {
-            self.split_active_pane_right();
-        } else if split_down {
-            self.split_active_pane_down();
+        if let Some(path) = collected.activate {
+            tab.active_path = path;
         }
-        if let Some((r, c)) = close_at {
-            self.close_pane(active_tab, r, c);
+        if let Some((path, dir)) = collected.split {
+            // Make sure the active pointer matches the pane we're splitting from,
+            // so split_active_pane operates on the right leaf even if the user
+            // clicked Split without first clicking the pane body.
+            self.tabs[active_tab].active_path = path;
+            self.split_active_pane(dir);
+        } else if let Some(path) = collected.close {
+            self.close_pane(active_tab, &path);
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_row(
-        ui: &mut egui::Ui,
-        tab_id: u64,
-        row_idx: usize,
-        row: &mut Vec<SerialSession>,
-        active_row: usize,
-        active_col: &mut usize,
-        active_row_out: &mut usize,
-        log_font_size: f32,
-        multi_pane: bool,
-        split_right: &mut bool,
-        split_down: &mut bool,
-        close_at: &mut Option<(usize, usize)>,
-    ) {
-        let n_cols = row.len();
-        if n_cols == 0 {
-            return;
-        }
-        for c in 0..n_cols.saturating_sub(1) {
-            let pane_id = row[c].id;
-            let panel_id = format!("pane_left_{}_{}_{}", tab_id, row_idx, pane_id);
-            let default_w = ui.available_width() / (n_cols - c) as f32;
-            egui::SidePanel::left(panel_id)
-                .resizable(true)
-                .default_width(default_w)
-                .min_width(220.0)
-                .show_inside(ui, |ui| {
-                    let is_active = active_row == row_idx && *active_col == c;
-                    let action = row[c].ui(ui, log_font_size, multi_pane, is_active);
-                    if action.split_right {
-                        *split_right = true;
-                    }
-                    if action.split_down {
-                        *split_down = true;
-                    }
-                    if action.close {
-                        *close_at = Some((row_idx, c));
-                    }
-                    if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
-                        *active_row_out = row_idx;
-                        *active_col = c;
-                    }
-                });
-        }
-        let last_c = n_cols - 1;
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
-            .show_inside(ui, |ui| {
-                let is_active = active_row == row_idx && *active_col == last_c;
-                let action = row[last_c].ui(ui, log_font_size, multi_pane, is_active);
-                if action.split_right {
-                    *split_right = true;
-                }
-                if action.split_down {
-                    *split_down = true;
-                }
-                if action.close {
-                    *close_at = Some((row_idx, last_c));
-                }
-                if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
-                    *active_row_out = row_idx;
-                    *active_col = last_c;
-                }
-            });
     }
 
     fn any_pane_busy(&self) -> bool {
-        self.tabs
-            .iter()
-            .flat_map(|t| t.rows.iter().flat_map(|r| r.iter()))
-            .any(|p| p.connected || p.connecting)
+        self.tabs.iter().any(|t| {
+            let mut busy = false;
+            for_each_leaf(&t.root, &mut |s| {
+                if s.connected || s.connecting {
+                    busy = true;
+                }
+            });
+            busy
+        })
     }
 }
 
@@ -517,6 +407,282 @@ struct PaneAction {
     split_right: bool,
     split_down: bool,
     close: bool,
+}
+
+#[derive(Default)]
+struct CollectedActions {
+    activate: Option<Vec<usize>>,
+    split: Option<(Vec<usize>, Direction)>,
+    close: Option<Vec<usize>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_node(
+    node: &mut LayoutNode,
+    ui: &mut egui::Ui,
+    path: Vec<usize>,
+    tab_id: u64,
+    active_path: &[usize],
+    log_font_size: f32,
+    multi_pane: bool,
+    actions: &mut CollectedActions,
+) {
+    match node {
+        LayoutNode::Leaf(session) => {
+            let is_active = path.as_slice() == active_path;
+            let pane_action = session.ui(ui, log_font_size, multi_pane, is_active);
+            if pane_action.split_right {
+                actions.split = Some((path.clone(), Direction::Horizontal));
+            } else if pane_action.split_down {
+                actions.split = Some((path.clone(), Direction::Vertical));
+            }
+            if pane_action.close {
+                actions.close = Some(path.clone());
+            }
+            if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
+                actions.activate = Some(path);
+            }
+        }
+        LayoutNode::Container { dir, children } => {
+            let dir = *dir;
+            let n = children.len();
+            if n == 0 {
+                return;
+            }
+            for i in 0..n.saturating_sub(1) {
+                let mut child_path = path.clone();
+                child_path.push(i);
+                let panel_id = format!("split_{}_{:?}", tab_id, child_path);
+                let avail = match dir {
+                    Direction::Horizontal => ui.available_width(),
+                    Direction::Vertical => ui.available_height(),
+                };
+                let default_size = avail / (n - i) as f32;
+                match dir {
+                    Direction::Horizontal => {
+                        egui::SidePanel::left(panel_id)
+                            .resizable(true)
+                            .default_width(default_size)
+                            .min_width(220.0)
+                            .show_inside(ui, |ui| {
+                                render_node(
+                                    &mut children[i],
+                                    ui,
+                                    child_path,
+                                    tab_id,
+                                    active_path,
+                                    log_font_size,
+                                    multi_pane,
+                                    actions,
+                                );
+                            });
+                    }
+                    Direction::Vertical => {
+                        egui::TopBottomPanel::top(panel_id)
+                            .resizable(true)
+                            .default_height(default_size)
+                            .min_height(140.0)
+                            .show_inside(ui, |ui| {
+                                render_node(
+                                    &mut children[i],
+                                    ui,
+                                    child_path,
+                                    tab_id,
+                                    active_path,
+                                    log_font_size,
+                                    multi_pane,
+                                    actions,
+                                );
+                            });
+                    }
+                }
+            }
+            let last = n - 1;
+            let mut last_path = path.clone();
+            last_path.push(last);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
+                .show_inside(ui, |ui| {
+                    render_node(
+                        &mut children[last],
+                        ui,
+                        last_path,
+                        tab_id,
+                        active_path,
+                        log_font_size,
+                        multi_pane,
+                        actions,
+                    );
+                });
+        }
+    }
+}
+
+// ---- Tree helpers ----
+
+fn count_leaves(node: &LayoutNode) -> usize {
+    match node {
+        LayoutNode::Leaf(_) => 1,
+        LayoutNode::Container { children, .. } => children.iter().map(count_leaves).sum(),
+    }
+}
+
+fn for_each_leaf<F: FnMut(&SerialSession)>(node: &LayoutNode, f: &mut F) {
+    match node {
+        LayoutNode::Leaf(s) => f(s),
+        LayoutNode::Container { children, .. } => {
+            for c in children {
+                for_each_leaf(c, f);
+            }
+        }
+    }
+}
+
+fn navigate_mut<'a>(node: &'a mut LayoutNode, path: &[usize]) -> Option<&'a mut LayoutNode> {
+    let mut cur = node;
+    for &idx in path {
+        cur = match cur {
+            LayoutNode::Container { children, .. } => children.get_mut(idx)?,
+            LayoutNode::Leaf(_) => return None,
+        };
+    }
+    Some(cur)
+}
+
+fn leaf_at_path_mut<'a>(node: &'a mut LayoutNode, path: &[usize]) -> Option<&'a mut SerialSession> {
+    match navigate_mut(node, path)? {
+        LayoutNode::Leaf(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn first_leaf_path(node: &LayoutNode) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut cur = node;
+    while let LayoutNode::Container { children, .. } = cur {
+        if children.is_empty() {
+            return path;
+        }
+        path.push(0);
+        cur = &children[0];
+    }
+    path
+}
+
+/// Insert a new leaf next to the leaf at `path`, splitting in `dir`.
+/// If the parent already arranges children in `dir`, the new leaf is appended
+/// as a sibling at `path[last]+1`. Otherwise the leaf at `path` is replaced
+/// with a new container of `dir` containing the original leaf followed by the
+/// new one. Returns the path to the newly inserted leaf.
+fn split_at_path(
+    root: &mut LayoutNode,
+    path: &[usize],
+    new_session: SerialSession,
+    dir: Direction,
+) -> Vec<usize> {
+    if path.is_empty() {
+        // Splitting the root leaf: replace root with a container holding [old, new].
+        // Take a placeholder container to swap into root, then put old leaf inside.
+        let old = std::mem::replace(
+            root,
+            LayoutNode::Container {
+                dir,
+                children: Vec::new(),
+            },
+        );
+        if let LayoutNode::Container { children, .. } = root {
+            children.push(old);
+            children.push(LayoutNode::Leaf(new_session));
+        }
+        return vec![1];
+    }
+
+    let parent_path = &path[..path.len() - 1];
+    let last_idx = path[path.len() - 1];
+
+    let Some(parent) = navigate_mut(root, parent_path) else {
+        return path.to_vec();
+    };
+
+    let LayoutNode::Container {
+        dir: parent_dir,
+        children,
+    } = parent
+    else {
+        return path.to_vec();
+    };
+
+    if *parent_dir == dir {
+        // Append as sibling — keeps the existing direction flat.
+        children.insert(last_idx + 1, LayoutNode::Leaf(new_session));
+        let mut new_path = parent_path.to_vec();
+        new_path.push(last_idx + 1);
+        new_path
+    } else {
+        // Wrap the leaf at this position in a new container of the new direction.
+        let old = std::mem::replace(
+            &mut children[last_idx],
+            LayoutNode::Container {
+                dir,
+                children: Vec::new(),
+            },
+        );
+        if let LayoutNode::Container {
+            children: inner, ..
+        } = &mut children[last_idx]
+        {
+            inner.push(old);
+            inner.push(LayoutNode::Leaf(new_session));
+        }
+        let mut new_path = path.to_vec();
+        new_path.push(1);
+        new_path
+    }
+}
+
+/// Remove the leaf at `path` and return the removed session. Does NOT collapse
+/// single-child containers — call `collapse_single_children` afterwards.
+fn remove_leaf_at_path(root: &mut LayoutNode, path: &[usize]) -> Option<SerialSession> {
+    if path.is_empty() {
+        // Caller is responsible for not removing the only leaf.
+        return None;
+    }
+    let parent_path = &path[..path.len() - 1];
+    let last_idx = path[path.len() - 1];
+    let parent = navigate_mut(root, parent_path)?;
+    let LayoutNode::Container { children, .. } = parent else {
+        return None;
+    };
+    if last_idx >= children.len() {
+        return None;
+    }
+    match children.remove(last_idx) {
+        LayoutNode::Leaf(s) => Some(s),
+        // Removing a non-leaf via this path isn't expected from the UI; if it
+        // somehow happened, the subtree is just dropped (sessions inside it
+        // are not shut down). The UI never produces such a request.
+        _ => None,
+    }
+}
+
+/// Walks the tree and replaces any `Container` with exactly one child by that
+/// child. Repeats until stable, including cascading collapses up the spine.
+fn collapse_single_children(node: &mut LayoutNode) {
+    loop {
+        let LayoutNode::Container { children, .. } = node else {
+            break;
+        };
+        if children.len() != 1 {
+            break;
+        }
+        let only = children.pop().unwrap();
+        *node = only;
+    }
+    if let LayoutNode::Container { children, .. } = node {
+        for c in children.iter_mut() {
+            collapse_single_children(c);
+        }
+    }
 }
 
 impl SerialSession {
@@ -1153,11 +1319,9 @@ impl eframe::App for GuiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for tab in &self.tabs {
-            for row in &tab.rows {
-                for s in row {
-                    let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
-                }
-            }
+            for_each_leaf(&tab.root, &mut |s| {
+                let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+            });
         }
     }
 }
