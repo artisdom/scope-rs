@@ -116,8 +116,11 @@ pub struct SerialSession {
 pub struct Tab {
     id: u64,
     title: String,
-    panes: Vec<SerialSession>,
-    active_pane: usize,
+    /// Rows of panes. Rows stack vertically (top-to-bottom).
+    /// Within each row, panes lay out side-by-side (left-to-right).
+    rows: Vec<Vec<SerialSession>>,
+    active_row: usize,
+    active_col: usize,
 }
 
 pub struct GuiApp {
@@ -160,8 +163,9 @@ impl GuiApp {
         Tab {
             id: tab_id,
             title,
-            panes: vec![session],
-            active_pane: 0,
+            rows: vec![vec![session]],
+            active_row: 0,
+            active_col: 0,
         }
     }
 
@@ -177,8 +181,10 @@ impl GuiApp {
             return;
         }
         // shut down all sessions in the tab
-        for s in &self.tabs[idx].panes {
-            let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+        for row in &self.tabs[idx].rows {
+            for s in row {
+                let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+            }
         }
         self.tabs.remove(idx);
         if self.active_tab >= self.tabs.len() {
@@ -186,32 +192,60 @@ impl GuiApp {
         }
     }
 
-    fn split_active_pane(&mut self) {
+    /// Add a new pane immediately to the right of the active pane (within the same row).
+    fn split_active_pane_right(&mut self) {
         let new_session = self.new_session();
         let tab = &mut self.tabs[self.active_tab];
-        let insert_at = tab.active_pane + 1;
-        tab.panes.insert(insert_at, new_session);
-        tab.active_pane = insert_at;
+        let row = &mut tab.rows[tab.active_row];
+        let insert_at = tab.active_col + 1;
+        row.insert(insert_at, new_session);
+        tab.active_col = insert_at;
     }
 
-    fn close_pane(&mut self, tab_idx: usize, pane_idx: usize) {
+    /// Add a new row containing one pane, immediately below the active row.
+    fn split_active_pane_down(&mut self) {
+        let new_session = self.new_session();
+        let tab = &mut self.tabs[self.active_tab];
+        let insert_at = tab.active_row + 1;
+        tab.rows.insert(insert_at, vec![new_session]);
+        tab.active_row = insert_at;
+        tab.active_col = 0;
+    }
+
+    fn close_pane(&mut self, tab_idx: usize, row_idx: usize, col_idx: usize) {
         if tab_idx >= self.tabs.len() {
             return;
         }
         let tab = &mut self.tabs[tab_idx];
-        if tab.panes.len() <= 1 {
+        // Refuse to close the last pane in the tab
+        let total: usize = tab.rows.iter().map(|r| r.len()).sum();
+        if total <= 1 {
             return;
         }
-        let removed = tab.panes.remove(pane_idx);
+        if row_idx >= tab.rows.len() || col_idx >= tab.rows[row_idx].len() {
+            return;
+        }
+        let removed = tab.rows[row_idx].remove(col_idx);
         let _ = removed.serial.cmd_tx.send(SerialCommand::Shutdown);
-        if tab.active_pane >= tab.panes.len() {
-            tab.active_pane = tab.panes.len() - 1;
+        // If the row is now empty, drop it
+        if tab.rows[row_idx].is_empty() {
+            tab.rows.remove(row_idx);
+            if tab.active_row >= tab.rows.len() {
+                tab.active_row = tab.rows.len() - 1;
+            }
+        } else if tab.active_row == row_idx && tab.active_col >= tab.rows[row_idx].len() {
+            tab.active_col = tab.rows[row_idx].len() - 1;
+        }
+        // Clamp active_col against whatever row we now point at
+        if tab.active_col >= tab.rows[tab.active_row].len() {
+            tab.active_col = tab.rows[tab.active_row].len() - 1;
         }
     }
 
     fn active_session_mut(&mut self) -> Option<&mut SerialSession> {
         let tab = self.tabs.get_mut(self.active_tab)?;
-        tab.panes.get_mut(tab.active_pane)
+        let row = tab.rows.get_mut(tab.active_row)?;
+        row.get_mut(tab.active_col)
     }
 
     fn save_active_log_to_timestamped_file(&mut self) {
@@ -333,79 +367,156 @@ impl GuiApp {
     fn render_active_tab(&mut self, ui: &mut egui::Ui) {
         let log_font_size = self.log_font_size;
         let active_tab = self.active_tab;
-        let mut split_request = false;
-        let mut close_pane_idx: Option<usize> = None;
+        let mut split_right = false;
+        let mut split_down = false;
+        let mut close_at: Option<(usize, usize)> = None;
 
         let tab = &mut self.tabs[active_tab];
-        if tab.panes.is_empty() {
+        if tab.rows.is_empty() {
             return;
         }
-        let n = tab.panes.len();
+        let n_rows = tab.rows.len();
+        let total_panes: usize = tab.rows.iter().map(|r| r.len()).sum();
+        let multi_pane = total_panes > 1;
+        let tab_id = tab.id;
 
-        // Render N-1 left side panels (resizable) and the last pane in central area.
-        for i in 0..n.saturating_sub(1) {
-            let pane_id = tab.panes[i].id;
-            let panel_id = format!("pane_panel_{}_{}", tab.id, pane_id);
-            let default_w = ui.available_width() / (n - i) as f32;
+        // Render top n_rows-1 rows as TopBottomPanel::top (resizable horizontal split),
+        // and the final row as a CentralPanel that fills remaining height.
+        for r in 0..n_rows.saturating_sub(1) {
+            let row_panel_id = format!("row_top_{}_{}", tab_id, r);
+            let default_h = ui.available_height() / (n_rows - r) as f32;
+            egui::TopBottomPanel::top(row_panel_id)
+                .resizable(true)
+                .default_height(default_h)
+                .min_height(140.0)
+                .show_inside(ui, |ui| {
+                    Self::render_row(
+                        ui,
+                        tab_id,
+                        r,
+                        &mut tab.rows[r],
+                        tab.active_row,
+                        &mut tab.active_col,
+                        &mut tab.active_row,
+                        log_font_size,
+                        multi_pane,
+                        &mut split_right,
+                        &mut split_down,
+                        &mut close_at,
+                    );
+                });
+        }
+
+        let last_row = n_rows - 1;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
+            .show_inside(ui, |ui| {
+                Self::render_row(
+                    ui,
+                    tab_id,
+                    last_row,
+                    &mut tab.rows[last_row],
+                    tab.active_row,
+                    &mut tab.active_col,
+                    &mut tab.active_row,
+                    log_font_size,
+                    multi_pane,
+                    &mut split_right,
+                    &mut split_down,
+                    &mut close_at,
+                );
+            });
+
+        if split_right {
+            self.split_active_pane_right();
+        } else if split_down {
+            self.split_active_pane_down();
+        }
+        if let Some((r, c)) = close_at {
+            self.close_pane(active_tab, r, c);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_row(
+        ui: &mut egui::Ui,
+        tab_id: u64,
+        row_idx: usize,
+        row: &mut Vec<SerialSession>,
+        active_row: usize,
+        active_col: &mut usize,
+        active_row_out: &mut usize,
+        log_font_size: f32,
+        multi_pane: bool,
+        split_right: &mut bool,
+        split_down: &mut bool,
+        close_at: &mut Option<(usize, usize)>,
+    ) {
+        let n_cols = row.len();
+        if n_cols == 0 {
+            return;
+        }
+        for c in 0..n_cols.saturating_sub(1) {
+            let pane_id = row[c].id;
+            let panel_id = format!("pane_left_{}_{}_{}", tab_id, row_idx, pane_id);
+            let default_w = ui.available_width() / (n_cols - c) as f32;
             egui::SidePanel::left(panel_id)
                 .resizable(true)
                 .default_width(default_w)
                 .min_width(220.0)
                 .show_inside(ui, |ui| {
-                    let action = tab.panes[i].ui(ui, log_font_size, n > 1, i == tab.active_pane);
-                    apply_pane_action(action, &mut split_request, &mut close_pane_idx, i);
+                    let is_active = active_row == row_idx && *active_col == c;
+                    let action = row[c].ui(ui, log_font_size, multi_pane, is_active);
+                    if action.split_right {
+                        *split_right = true;
+                    }
+                    if action.split_down {
+                        *split_down = true;
+                    }
+                    if action.close {
+                        *close_at = Some((row_idx, c));
+                    }
                     if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
-                        tab.active_pane = i;
+                        *active_row_out = row_idx;
+                        *active_col = c;
                     }
                 });
         }
-
-        let last_idx = n - 1;
+        let last_c = n_cols - 1;
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show_inside(ui, |ui| {
-                let action =
-                    tab.panes[last_idx].ui(ui, log_font_size, n > 1, last_idx == tab.active_pane);
-                apply_pane_action(action, &mut split_request, &mut close_pane_idx, last_idx);
+                let is_active = active_row == row_idx && *active_col == last_c;
+                let action = row[last_c].ui(ui, log_font_size, multi_pane, is_active);
+                if action.split_right {
+                    *split_right = true;
+                }
+                if action.split_down {
+                    *split_down = true;
+                }
+                if action.close {
+                    *close_at = Some((row_idx, last_c));
+                }
                 if ui.input(|inp| inp.pointer.any_click()) && ui.ui_contains_pointer() {
-                    tab.active_pane = last_idx;
+                    *active_row_out = row_idx;
+                    *active_col = last_c;
                 }
             });
-
-        if split_request {
-            self.split_active_pane();
-        }
-        if let Some(idx) = close_pane_idx {
-            self.close_pane(active_tab, idx);
-        }
     }
 
     fn any_pane_busy(&self) -> bool {
         self.tabs
             .iter()
-            .flat_map(|t| t.panes.iter())
+            .flat_map(|t| t.rows.iter().flat_map(|r| r.iter()))
             .any(|p| p.connected || p.connecting)
     }
 }
 
 #[derive(Default)]
 struct PaneAction {
-    split: bool,
+    split_right: bool,
+    split_down: bool,
     close: bool,
-}
-
-fn apply_pane_action(
-    action: PaneAction,
-    split_request: &mut bool,
-    close_pane_idx: &mut Option<usize>,
-    idx: usize,
-) {
-    if action.split {
-        *split_request = true;
-    }
-    if action.close {
-        *close_pane_idx = Some(idx);
-    }
 }
 
 impl SerialSession {
@@ -770,11 +881,18 @@ impl SerialSession {
                     action.close = true;
                 }
                 if ui
-                    .small_button("⮆ Split")
-                    .on_hover_text("Open another serial pane next to this one")
+                    .small_button("▼ Split down")
+                    .on_hover_text("Open another serial pane below this one")
                     .clicked()
                 {
-                    action.split = true;
+                    action.split_down = true;
+                }
+                if ui
+                    .small_button("▶ Split right")
+                    .on_hover_text("Open another serial pane to the right of this one")
+                    .clicked()
+                {
+                    action.split_right = true;
                 }
             });
         });
@@ -1035,8 +1153,10 @@ impl eframe::App for GuiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for tab in &self.tabs {
-            for s in &tab.panes {
-                let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+            for row in &tab.rows {
+                for s in row {
+                    let _ = s.serial.cmd_tx.send(SerialCommand::Shutdown);
+                }
             }
         }
     }
