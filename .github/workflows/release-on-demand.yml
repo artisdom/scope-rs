@@ -1,0 +1,90 @@
+name: On-demand release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name for the release (e.g. v0.4.5-rc1). Leave empty to only upload build artifacts without creating a release."
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark as prerelease"
+        type: boolean
+        default: true
+      draft:
+        description: "Create as draft release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: linux-x86_64
+            ext: ""
+          - os: windows-latest
+            asset: windows-x86_64
+            ext: ".exe"
+          - os: macos-latest
+            asset: macos-arm64
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/scope${{ matrix.ext }}" "dist/scope-${{ matrix.asset }}${{ matrix.ext }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: ${{ inputs.tag != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          generate_release_notes: true
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            dist/**
